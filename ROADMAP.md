@@ -59,10 +59,30 @@ journaled `ok` invocation. Acceptance: 13 lifecycle + negative tests.
 ## S2 — APM as normative spec (next)
 
 Promote the experiment: `spec/apm.md` fixing the intent lifecycle state
-machine, delegation-graph queries, approval/attention as blocking states
-invariant #9 already names, and the context-lineage merge semantics M4
-will harden. The APM graduate to "OS-primitive-shaped" claims only past
-the decision test above.
+machine and the delegation graph. S2 is not the current API transcribed
+to prose; it answers the four questions the S1 experiment exposed:
+
+1. **What handoff transfers.** S1's settled answer, to be tested: the
+   intent (goal, context, approval state, budget accounting, children,
+   evidence) moves; the envelope does NOT — relocating a grant without
+   the granter's re-consent would be ambient authority. S2 must define
+   the re-delegation protocol and what happens to *in-flight* calls.
+2. **Completion obligation.** `complete(evidence)` currently proves
+   "this intent made at least one successful call", not "the goal was
+   achieved." S2 defines which receipts correspond to which goal.
+3. **Delegation-graph closure.** May a parent complete while children
+   are still live? Today: yes, silently. S2 makes closure a rule with
+   its own journal facts.
+4. **Approval/attention as a resource.** Is approval a boolean gate, or
+   a human resource that can be waited on, expired, forwarded, and
+   consumed? The shape decides M2's lease semantics — M2 stays blocked
+   until S2 answers.
+
+Plus one hardening debt S1 leaves open: `Intent.state/approval/evidence`
+are public fields — fine while S1 is an experiment, but the strong
+claim ("an agent cannot claim it finished") requires the lifecycle
+state to be private behind read-only views in S2. The APM graduate to
+"OS-primitive-shaped" claims only past the decision test above.
 
 # Track E — enforcement
 

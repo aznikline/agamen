@@ -154,19 +154,35 @@ test("delegate creates a child on the other agent; ownership stays with the pare
   assert.ok(helper.intents.has(child.id) && !boss.intents.has(child.id));
 });
 
-test("handoff MOVES the intent whole: envelope grants follow the new holder", async () => {
+test("handoff MOVES the intent but never the authority: envelope dies, new holder re-grants", async () => {
   const rt = new Runtime();
   const sys = new AgentSystem(rt);
   const { server } = rt.serve("svc", "t", async (a) => a.v);
   const a1 = sys.register("a1");
   const a2 = sys.register("a2");
-  const intent = sys.open(a1, { goal: { outcome: "carry" } });
+  const intent = sys.open(a1, { goal: { outcome: "carry" }, budget: { calls: 5 } });
+  const slot = sys.grantFor(intent, server, "t"); // envelope installed on a1 BEFORE handoff
+  await sys.call(intent, slot, { v: 1 });
+  const carriedCap = rt.holds(a1.control, slot); // the token handoff must kill
   sys.handoff(intent, a2);
+  // 1. the principal-side registry follows the intent…
   assert.equal(a1.intents.has(intent.id), false);
-  const slot = sys.grantFor(intent, server, "t"); // installs on a2 now
-  const { result } = await sys.call(intent, slot, { v: 42 });
+  assert.equal(a2.intents.has(intent.id), true);
+  assert.equal(intent.agent, a2);
+  assert.equal(intent.spent, 1); // …and so does the budget ACCOUNTING
+  // 2. …but the envelope does NOT: unilaterally relocating a grant would
+  //    be ambient authority. The old cap is revoked and the intent-level
+  //    envelope check denies before the substrate is ever consulted.
+  assert.equal(rt.isRevoked(carriedCap), true); // the token is dead, though a1's slot table still names it
+  assert.equal(await asyncCode(sys.call(intent, slot, { v: 2 })), "E_NO_CAP");
+  const fact = evs(rt, "intent_handoff").at(-1);
+  assert.equal(fact.to, a2.id);
+  assert.equal(fact.envelope, "revoked");
+  assert.deepEqual(fact.slots, [slot]);
+  // 3. the new holder re-earns authority explicitly, on its own slot table
+  const slot2 = sys.grantFor(intent, server, "t");
+  const { result } = await sys.call(intent, slot2, { v: 42 });
   assert.equal(result, 42);
-  assert.equal(evs(rt, "intent_handoff").at(-1).to, a2.id);
 });
 
 /* ---------- suspend / resume on another model ---------- */

@@ -116,7 +116,7 @@ possession; subtree revocation is a trusted-plane act. Both were
 | xact identity | — *correlationId journaled on allow+deny*; *runtime-branded E_FOREIGN (F14)* |
 | budget scope | — *membrane budgets per grant subtree (F15)*; *charged-attempt ordering (F15b)* |
 | non-conforming seam | — *bench sink explicit, journal unreachable (F7)* |
-| APM lifecycle (S1) | `test/intent.test.mjs`: *evidence-backed completion gate*; *approval precedes effect*; *budget + envelope membership*; *fork/delegate/handoff/suspend/resume(new model)/revoke cascade*; *context lineage isolation + merge accept/reject*; *deadline failure journaled at intent level* |
+| APM lifecycle (S1) | `test/intent.test.mjs`: *evidence-backed completion gate*; *approval precedes effect*; *budget + envelope membership*; *fork/delegate/suspend/resume(new model)/revoke cascade*; ***handoff moves the intent, never the authority — envelope revoked, re-grant required***; *context lineage isolation + merge accept/reject*; *deadline failure journaled at intent level* |
 | atomic spawn | pending M5 (kernel backend) |
 | pointer fault | pending M5 |
 | context isolation | pending M4 (S1 Context is the incubator) |

@@ -196,16 +196,32 @@ export class AgentSystem {
     return child;
   }
 
-  /** Handoff: ownership MOVES — the intent (envelope, context, budget
-   *  state) relocates to another agent whole. Contrast delegate, which
-   *  spawns a child elsewhere. */
+  /** Handoff: the INTENT moves, its AUTHORITY does not. Goal, context
+   *  lineage, approval state, budget accounting, children and evidence
+   *  relocate to the new holder whole; every envelope capability is
+   *  REVOKED and the fact is journaled. This is not a shortfall — it is
+   *  the ocap consent principle: a capability was minted by a granter
+   *  who consented to serve THIS agent's slot table; no act of the
+   *  current holder can unilaterally re-point that consent at another
+   *  principal. Authority that "moved with the ticket" would be an
+   *  ambient right. The new holder re-delegates explicitly
+   *  (grantFor), and only what it re-earns it may spend. Contrast
+   *  delegate, which spawns a child elsewhere and keeps ownership. */
   handoff(intent, targetAgent) {
     this.#requireLive(intent);
     const from = intent.agent;
     from.intents.delete(intent.id);
     targetAgent.intents.set(intent.id, intent);
     intent.agent = targetAgent;
-    this.#fact({ t: "intent_handoff", intent: intent.id, from: from.id, to: targetAgent.id });
+    for (const { cap } of intent.envelope) {
+      try { this.rt.revoke(cap); } catch { /* already dead — foreign/revoked */ }
+    }
+    const slots = intent.envelope.map((e) => e.slot);
+    intent.envelope = []; // new holder must re-grant before it can call
+    this.#fact({
+      t: "intent_handoff", intent: intent.id, from: from.id, to: targetAgent.id,
+      envelope: "revoked", slots,
+    });
     return intent;
   }
 
