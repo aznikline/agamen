@@ -52,11 +52,18 @@ EL0 traps. The mapping is 1:1 on purpose:
 | `Membrane`                | endpoint caps; approval lease (P4)   |
 | `Provenance`              | audit chokepoint (spec 13 §13)       |
 
-Agamen is form-first: semantics are argued, broken, and measured in 200 lines
-of JavaScript before any of them costs a kernel ABI. The mapping above is a
-migration contract, not a submission queue — agate is one *candidate
-enforcement backend* for these semantics (ROADMAP M5), alongside a hardened
-userspace runtime or, eventually, Agamen's own kernel.
+Agamen is form-first: semantics are argued, broken, and measured in ~500
+lines of JavaScript before any of them costs a kernel ABI. Since M1.5 the
+in-realm enforcement is not merely a demonstration: the negative tests
+(`test/runtime.test.mjs`) treat hostile same-realm JS as the adversary, so
+M0/M1 are executable semantics *and* enforced semantics up to the boundary
+of the JavaScript realm. The mapping above is a migration contract, not a
+submission queue — agate is one *candidate enforcement backend* for these
+semantics (ROADMAP M5), alongside a hardened userspace runtime or,
+eventually, Agamen's own kernel. The graduation criterion is deliberately
+narrow: a primitive earns kernel cost only when the remaining gap is
+something userspace provably cannot close (realm-crossing identity,
+preemption, atomic creation), not because the JS enforcement was inconvenient.
 
 ## 4. Enforcement criteria (when a primitive moves below the substrate)
 

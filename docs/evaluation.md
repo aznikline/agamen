@@ -27,7 +27,10 @@ that smuggles in machine-dependent constants.
 ## 2. Benchmark hierarchy (low → high)
 
 1. **Microkernels (M1 harness)**: synthetic invokes — 1 cap, 0/1/3 mem-
-   branes, journal on/off. Purpose: fit the §1 cost model coefficients.
+   branes, journaling measured both ways: conforming SHA-256 vs the
+   explicitly non-conforming `bench:` sink (there is no journal-off seam;
+   see `spec/invariants.md` #10). Purpose: fit the §1 cost model
+   coefficients.
 2. **Full kernels**: complete agent workloads — a tool-loop (actor →
    capability-gated tool → reply, K iterations, one xact), a fan-out
    (1 client → n servers), a chain delegation (grant moves through d
