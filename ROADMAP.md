@@ -58,7 +58,7 @@ provable against each other. The negative gate is the milestone:
 `complete()` refuses without at least one evidence item backed by a
 journaled `ok` invocation. Acceptance: 13 lifecycle + negative tests.
 
-## S2 — APM as normative spec (rev. S2.0.4, `spec/apm.md`)
+## S2 — APM as normative spec (rev. S2.0.5, `spec/apm.md`)
 
 The spec stands on its own, independent of the JavaScript prototype. It
 is built on three separations — **Ownership is not authority. Evidence
@@ -202,6 +202,44 @@ immediately-pre-fix `0a002d8` (and the old 28 still pass there — the
 closure changes no behavior the earlier suite legitimately pinned).
 Next, in spec order: the COMPLETING skeleton (ST-1 + four kinds +
 matcher + working-set commit) → DC-5.
+
+**S2.1b progress** (2026-09-19, principal/context closure, round-8
+directives): the review of `a0a97b9` signed ST-2 but not ST-3 — the
+read-only view still bled mutable truth through two REFERENCES, and the
+lesson generalizes: field-level locking is not enough; a safety
+boundary over authoritative state must hold over the WHOLE reachable
+object graph. (1) `intent.agent` had been handing out the writable
+host-plane AgentExecution — `agent.model = …` bypassed the journalled
+rebind, `agent.intents.clear()` rewrote history, and `agent.sys.rt`
+gave any token holder the Runtime itself, which in this threat model is
+the trusted control plane. AgentExecution is gone: an agent is now a
+branded private record (system, id, label, model, control, context
+head, intent registry) behind an inert frozen **AgentPrincipal** view
+carrying only readable identity — OT-0's "Identity is not execution",
+applied to the API surface. (2) Branding got unforgeable: the old
+agent-brand check read the public-writable `agent.sys`, so
+`foreignAgent.sys = sysA` manufactured membership; every brand check
+now reads the private RECORD via the principal token, and the new
+oracle attacks the brand itself (`.sys`/`.control` tampering), not just
+a foreign object. (3) The context getter leaked the live mutable
+Context — `intent.context.mutate(…)` changed belief state with no
+owned act and no fact, contradicting §1's own "ContextVersion =
+immutable belief snapshot". Split: private ContextHead, externally a
+frozen ContextView (version, lineage, snapshot); belief change is
+`sys.mutateContext` / `sys.mergeContext`, each journalling
+`context_version {intent, fromVersion, toVersion, cause}`.
+(4) Intent, AgentPrincipal and ContextView instances are frozen at
+construction, and a transitive read-only walk test asserts every value
+reachable from a token — goal, contract, evidence, children, envelope,
+context, agent, parent — is a frozen snapshot, another token, or the
+declared opaque-handle exception. `runtime.js` untouched (zero diff);
+CO-5's admit-hook shape unchanged. 38/38 APM + 51/51 invariant tests;
+all four new S2.1b oracles fail against pre-fix `a0a97b9` for their
+intended reasons (three additional pre-fix failures are old tests
+adapted to the new `hasIntent`/`mutateContext` API, not behavior
+regressions). With this the trusted-state base is closed — per the
+review, closure work STOPS here; next, in spec order: the COMPLETING
+skeleton (ST-1 + four kinds + matcher + working-set commit) → DC-5.
 
 # Track E — enforcement
 

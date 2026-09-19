@@ -4,16 +4,27 @@
  * Conformance target: spec/apm.md. Landed so far: S1's lifecycle +
  * evidence gate; S2.1's CO-5 dispatch-time obligation binding
  * (receipt-kind CompletionContracts, append-only amend, ownerEpoch /
- * contractRevision stamps on every dispatch); and the ST-3/ST-2 trusted
- * state base, closed by S2.1a: an Intent is a read-only token whose
- * EVERY decision-relevant field lives in one private record —
+ * contractRevision stamps on every dispatch); the ST-3/ST-2 trusted
+ * state base closed by S2.1a; and S2.1b, which moves the boundary from
+ * the field list to the REACHABLE OBJECT GRAPH: an Intent is a read-only
+ * view over authoritative state, and no getter path from it reaches a
+ * mutable host object. An agent as seen through an intent is an
+ * AgentPrincipal — the spec §1 object: identity (id, label, model as
+ * read), never execution (control/sys/internals stay in a private,
+ * system-branded record); context is a stream of immutable
+ * ContextVersions behind a read-only view, and belief mutation is an
+ * AgentSystem act that journals `context_version {fromVersion,
+ * toVersion, cause}` — Identity is not execution, applied to the API
+ * surface itself.
+ *
+ * The private record of an Intent holds EVERY decision-relevant field —
  * relations (agent, parent, children), configuration (goal, budget,
- * deadline, approval, context) and determinable state (state,
+ * deadline, approval, context head) and determinable state (state,
  * stateVersion, contract, contractRevision, ownerEpoch, envelope,
- * evidence, spent). The record is BRANDED with the AgentSystem that
- * wrote it: an intent's state is defined by exactly one ledger, and any
- * other system touching it is refused (E_FOREIGN) before it can write a
- * fact into the wrong place. Views out are true immutable snapshots
+ * evidence, spent) — and is BRANDED with the AgentSystem that owns it:
+ * an intent's state is defined by exactly one ledger, and any other
+ * system touching it is refused (E_FOREIGN) before it can write a fact
+ * into the wrong place. Views out are true immutable snapshots
  * (structuredClone + deepFreeze; capability tokens keep reference
  * identity — they are opaque handles, not data to copy), and every
  * lifecycle edge rides one transition primitive (spec ST-2) journaling
@@ -32,16 +43,17 @@
  * lineage, and its exit status is evidence, not an exit code. So this
  * file makes two objects first class:
  *
- *   AgentExecution — a principal: identity + authority surface + context
- *     lineage + active intents + execution history. NOT a thread: the
- *     "program counter" is the intent tree.
+ *   AgentPrincipal — a principal: identity + context lineage + intent
+ *     registry, exposed as an inert frozen view; the execution surface
+ *     (ActorControl, slot tables) lives only in the private record.
+ *     NOT a thread: the "program counter" is the intent tree.
  *   Intent — the schedulable unit: a requested outcome inside an
  *     authority envelope with budget, deadline, approval state, child
  *     intents, and completion evidence. Like a process it has a lifecycle
  *     (open/fork/delegate/handoff/suspend/resume/revoke/complete); unlike
  *     a process it can be resumed on a different model and it cannot
  *     complete without journal-backed evidence. To its holder it is a
- *     VIEW: readable, never writable.
+ *     VIEW: readable, never writable — transitively.
  *
  * Enforcement stays in the v1.6 substrate: agents are Runtime actors,
  * envelopes are capability grants with membranes, deadlines and outcomes
@@ -100,14 +112,17 @@ function normalizeContract(list) {
   return out;
 }
 
-/* ---------- contexts: the new memory model ----------
- * A context is a plain-data snapshot. Lineage = the ordered record of
- * transitions; fork copies the current snapshot, child mutations stay
- * isolated until an explicit merge_context, which may be accepted or
- * rejected. The fork/join discipline, but over BELIEFS. mutate() is the
- * SANCTIONED holder path for beliefs; what no holder may do is replace
- * the reference or edit the lineage — it is append-only through the
- * object's own three verbs, and reads come out frozen. */
+/* ---------- contexts: ContextVersion in, ContextHead out (S2.1b) ----------
+ * Spec §1 defines a ContextVersion as an IMMUTABLE belief snapshot with
+ * a born/mutate/merge lineage. A live `Context` object with a public
+ * mutate() contradicted that — it leaked out of the Intent's read-only
+ * view and let holders rewrite the belief state that future merges and
+ * context obligations read, with no AgentSystem act and no fact. So the
+ * concept is now split the way the spec splits it: the HEAD (mutable
+ * data + version + lineage) lives only inside private records; what a
+ * view hands out is an immutable read surface, and every belief change
+ * is `mutateContext`/`mergeContext` — an AgentSystem act journalling
+ * context_version {fromVersion, toVersion, cause}. */
 
 function cloneContext(data) {
   try {
@@ -140,73 +155,91 @@ function snapshot(v) {
   }
 }
 
-class Context {
-  #data;
-  #lineage = [];
+class ContextHead {
+  data;
+  version = 0;
+  lineage;
+  view;
 
   constructor(data = {}, seed = "root") {
-    this.#data = cloneContext(data);
-    this.#lineage.push({ at: nowIso(), event: "born", from: seed });
+    this.data = cloneContext(data);
+    this.lineage = [{ at: nowIso(), event: "born", from: seed, toVersion: 0 }];
+    this.view = new ContextView(this);
   }
-  get lineage() {
-    return Object.freeze(this.#lineage.map((l) => Object.freeze({ ...l })));
-  }
-  snapshot() {
-    return cloneContext(this.#data);
-  }
-  mutate(next) {
-    this.#data = cloneContext(next);
-    this.#lineage.push({ at: nowIso(), event: "mutate" });
-  }
-  absorb(other, fromIntentId) {
-    this.#data = cloneContext(other.snapshot());
-    this.#lineage.push({ at: nowIso(), event: "merge", from: fromIntentId });
+  advance(nextData, event, from) {
+    const fromVersion = this.version;
+    this.data = cloneContext(nextData);
+    this.version += 1;
+    this.lineage.push({ at: nowIso(), event, from, fromVersion, toVersion: this.version });
+    return fromVersion;
   }
 }
 
-/* ---------- AgentExecution ---------- */
-
-export class AgentExecution {
-  id;
-  label;
-  model;
-  control; // ActorControl handle — host-plane only, never handed into the agent realm
-  context;
-  sys; // host-plane back-reference (AgentSystem); intents check it for ownership
-  intents = new Map(); // id -> Intent (active and terminal; the execution history)
-
-  constructor(sys, label, { model = null, context = {} } = {}) {
-    this.sys = sys;
-    this.id = `agent${nextAgent++}`;
-    this.label = label;
-    this.model = model;
-    this.context = new Context(context, this.id);
-    this.control = sys.rt.spawn(`agent:${label}`);
-    sys.rt.record({ t: "agent_register", agent: this.id, label, model });
-    sys.agents.set(this.id, this);
+class ContextView {
+  #head;
+  constructor(head) {
+    this.#head = head;
+    Object.freeze(this); // no own-property pollution on the read surface
   }
-
-  identity() {
-    return this.sys.rt.identityOf(this.control); // the only handle that may be shown to others
+  get version() { return this.#head.version; }
+  get lineage() {
+    return Object.freeze(this.#head.lineage.map((l) => Object.freeze({ ...l })));
   }
+  snapshot() {
+    return snapshot(this.#head.data); // frozen deep clone — the belief, as data
+  }
+}
 
+/* ---------- principals: identity, not execution (OT-0, S2.1b) ----------
+ * An `AgentExecution` that IS the record — public control, sys, intents
+ * Map — made a read-only Intent a side door into the host plane: through
+ * `intent.agent` a holder could rebind `model` with no agent_rebind
+ * fact, replace `control` (the executing principal!), clear `intents`,
+ * and reach `sys.rt` — the TRUSTED control plane itself. And the
+ * agent brand was forgery-prone because it read a public field. So the
+ * object splits in two, exactly as spec §1 names it:
+ *   AGENT_PRIV record — execution + ownership: system brand, control
+ *     handle, slot/intent registry, context head, model.
+ *   AgentPrincipal view — identity: id, label, model AS READ, intentIds,
+ *     a read-only context view. Frozen; control/sys/internals are not
+ *     properties on it at all; the brand check reads the RECORD, so
+ *     `foreign.sys = sysA` forges nothing. */
+
+const AGENT_PRIV = new WeakMap(); // AgentPrincipal -> {system, id, label, model, control, context: ContextHead, intents: Map}
+
+export class AgentPrincipal {
+  #rec;
+  constructor(rec) {
+    this.#rec = rec;
+    Object.freeze(this);
+  }
+  get id() { return this.#rec.id; }
+  get label() { return this.#rec.label; }
+  get model() { return this.#rec.model; }
+  get context() { return this.#rec.context.view; }
+  get intentIds() { return Object.freeze([...this.#rec.intents.keys()]); }
+  hasIntent(id) { return this.#rec.intents.has(id); }
   activeIntents() {
-    return [...this.intents.values()].filter((i) => ["open", "active", "suspended"].includes(i.state));
+    return Object.freeze(
+      [...this.#rec.intents.values()].filter((i) => ["open", "active", "suspended"].includes(i.state)).map((i) => i.id)
+    );
+  }
+  identity() {
+    return this.#rec.system.rt.identityOf(this.#rec.control); // the ActorId plain snapshot — the only handle that may be shown around
   }
 }
 
 /* ---------- Intent: a token; the truth is branded and private (ST-3) ----------
- * What a holder carries is a VIEW with no writable surface at all: even
- * `id` is private state, because every check, every ledger correlation
- * and every replay keys on it. The private record holds the ENTIRE
- * decision-relevant set — relations, configuration and derived state —
- * because any field left public is the side door that re-enables the
- * bypass the previous round plugged (intent.approval = "not_required"
- * walked past the approval gate; children.clear() escaped the revoke
- * cascade; a bare intent.agent = … skipped handoff's envelope kill,
- * epoch++ and fact). The record also names its owning AgentSystem:
- * PRIV is module-wide, but only the branding system may read-modify
- * through its own checked accessor. */
+ * What a holder carries is a VIEW with no writable surface at all: the
+ * instance itself is frozen (no property pollution), `id` is private
+ * because every check and ledger correlation keys on it, and the record
+ * holds the ENTIRE decision-relevant closure — because any reachable
+ * mutable object is a bypass regardless of which field named it
+ * (approval = "not_required" walked past the gate; children.clear()
+ * escaped the revoke cascade; `agent = …` skipped handoff's envelope
+ * kill, epoch++ and fact; and last round's "fixed" agent getter leaked
+ * the whole host plane BY REFERENCE). Views out are true snapshots;
+ * capability tokens are the declared reference-identity exception. */
 
 const PRIV = new WeakMap(); // Intent -> {system, …the one authoritative record}
 
@@ -226,14 +259,14 @@ export class Intent {
     this.#id = `i${nextIntent++}`;
     PRIV.set(this, {
       system, // ST-3 ownership boundary: exactly one AgentSystem defines this record
-      agent, // AgentExecution currently holding the envelope
+      agent, // AgentPrincipal currently holding the envelope
       parent,
       children: new Set(), // child intent ids — the revoke cascade walks this
       goal: cloneContext(goal), // the requested outcome, plain data
       budget: budget === null ? null : cloneContext(budget), // {calls} charged per mediated attempt
       deadline, // absolute ms, enforced by the substrate at request time
       approval, // "not_required" | "required" | { approved, at }
-      context: new Context(contextSeed, this.#id),
+      context: new ContextHead(contextSeed, this.#id),
       openedAt: nowIso(),
       // state null / version -1 until the OPEN genesis edge lands them at
       // open / 0 through the same primitive as every other edge (ST-2)
@@ -246,17 +279,18 @@ export class Intent {
       evidence: [],
       spent: 0, // charged-attempt accounting through call()
     });
+    Object.freeze(this); // the token itself accepts no own properties
   }
 
   get id() { return this.#id; }
-  get agent() { return PRIV.get(this).agent; }
-  get parent() { return PRIV.get(this).parent; }
+  get agent() { return PRIV.get(this).agent; } // AgentPrincipal VIEW — identity only, never control/sys
+  get parent() { return PRIV.get(this).parent; } // another read-only token
   get children() { return Object.freeze([...PRIV.get(this).children]); }
   get goal() { return snapshot(PRIV.get(this).goal); }
   get budget() { return snapshot(PRIV.get(this).budget); }
   get deadline() { return PRIV.get(this).deadline; }
   get approval() { return snapshot(PRIV.get(this).approval); }
-  get context() { return PRIV.get(this).context; } // beliefs: mutate() is the sanctioned holder path
+  get context() { return PRIV.get(this).context.view; } // immutable read surface; mutation is sys.mutateContext
   get openedAt() { return PRIV.get(this).openedAt; }
   get state() { return PRIV.get(this).state; }
   get stateVersion() { return PRIV.get(this).stateVersion; }
@@ -274,19 +308,20 @@ export class Intent {
 
 export class AgentSystem {
   rt;
-  agents = new Map(); // id -> AgentExecution
+  agents = new Map(); // id -> AgentPrincipal
   intents = new Map(); // id -> Intent (system-wide index, incl. handed-off ones)
 
   constructor(rt) {
     this.rt = rt;
   }
 
-  /* THE accessor (ST-3): no AgentSystem method reaches a private record
-   * without passing here. PRIV is shared module-wide, so without the
-   * brand a second AgentSystem could drive an intent's state and journal
-   * the edges into a DIFFERENT ledger — then "ledger replay reconstructs
-   * the state" would be false for the ledger that actually minted the
-   * intent. Foreign touch: E_FOREIGN, before any fact, any mutation. */
+  /* THE intent accessor (ST-3): no AgentSystem method reaches a private
+   * record without passing here. PRIV is shared module-wide, so without
+   * the brand a second AgentSystem could drive an intent's state and
+   * journal the edges into a DIFFERENT ledger — then "ledger replay
+   * reconstructs the state" would be false for the ledger that actually
+   * minted the intent. Foreign touch: E_FOREIGN, before any fact, any
+   * mutation. */
   #R(intent) {
     const r = PRIV.get(intent);
     if (!r || r.system !== this) {
@@ -295,32 +330,52 @@ export class AgentSystem {
     return r;
   }
 
-  #ownAgent(agent, role) {
-    if (!(agent instanceof AgentExecution) || agent.sys !== this) {
+  /* THE agent accessor: the brand lives in the RECORD (AGENT_PRIV), not
+   * on the view — so it cannot be forged by writing `.sys`, `.id` or
+   * anything else onto a principal someone handed you. */
+  #A(agent, role = "agent") {
+    const r = agent instanceof AgentPrincipal ? AGENT_PRIV.get(agent) : undefined;
+    if (!r || r.system !== this) {
       throw new SubstrateError("E_FOREIGN", `this ${role} belongs to another AgentSystem`);
     }
+    return r;
   }
 
   register(label, opts = {}) {
-    return new AgentExecution(this, label, opts);
+    const { model = null, context = {} } = opts;
+    const rec = {
+      system: this,
+      id: `agent${nextAgent++}`,
+      label,
+      model,
+      control: this.rt.spawn(`agent:${label}`),
+      context: new ContextHead(context, `agent:${label}`),
+      intents: new Map(),
+    };
+    const principal = new AgentPrincipal(rec);
+    rec.principal = principal;
+    AGENT_PRIV.set(principal, rec);
+    this.rt.record({ t: "agent_register", agent: rec.id, label, model });
+    this.agents.set(rec.id, principal);
+    return principal;
   }
 
   open(agent, { goal, budget = null, deadline = null, approval = "not_required", context = {}, contract = [] } = {}) {
-    this.#ownAgent(agent, "agent");
+    const arec = this.#A(agent);
     if (!goal || typeof goal !== "object") throw new SubstrateError("E_INVAL", "goal must describe the requested outcome");
     const intent = new Intent({ system: this, agent, goal, budget, deadline, approval, contextSeed: context, contract });
-    this.#track(agent, intent);
+    this.#track(arec, intent);
     const rec = this.#R(intent);
     this.#fact({
-      t: "intent_open", intent: intent.id, agent: agent.id, goal, budget, deadline, approval,
+      t: "intent_open", intent: intent.id, agent: arec.id, goal, budget, deadline, approval,
       contract: rec.contract.map((o) => o.id),
     });
     this.#transition(intent, "open", "open"); // genesis rides the same primitive — no special case
     return intent;
   }
 
-  /** Fork: a child intent on the SAME agent; its context branches from a
-   *  copy of the parent's snapshot. */
+  /** Fork: a child intent on the SAME principal; its context branches
+   *  from a copy of the parent's current version. */
   fork(parentIntent, { goal, budget = null, deadline = null, approval, contract = [] } = {}) {
     const rec = this.#R(parentIntent);
     this.#guardLive(rec);
@@ -334,20 +389,20 @@ export class AgentSystem {
       budget,
       deadline,
       approval: approval ?? rec.approval,
-      contextSeed: rec.context.snapshot(),
+      contextSeed: rec.context.data,
       contract,
     });
     rec.children.add(child.id);
-    this.#track(rec.agent, child);
+    this.#track(AGENT_PRIV.get(rec.agent), child);
     this.#fact({ t: "intent_fork", intent: child.id, parent: parentIntent.id, agent: rec.agent.id });
     this.#transition(child, "open", "fork"); // genesis rides the same primitive
     return child;
   }
 
-  /** Delegate: a NEW child intent executed by another agent; the parent
-   *  keeps ownership and receives the merged result. */
+  /** Delegate: a NEW child intent executed by another principal; the
+   *  parent keeps ownership and receives the merged result. */
   delegate(parentIntent, targetAgent, { goal, budget = null, deadline = null, approval, contract = [] } = {}) {
-    this.#ownAgent(targetAgent, "delegate target");
+    const target = this.#A(targetAgent, "delegate target");
     const rec = this.#R(parentIntent);
     this.#guardLive(rec);
     const child = new Intent({
@@ -358,14 +413,14 @@ export class AgentSystem {
       budget,
       deadline,
       approval: approval ?? rec.approval,
-      contextSeed: rec.context.snapshot(),
+      contextSeed: rec.context.data,
       contract,
     });
     rec.children.add(child.id);
-    this.#track(targetAgent, child);
+    this.#track(target, child);
     this.#fact({
       t: "intent_delegate", intent: child.id, parent: parentIntent.id,
-      from: rec.agent.id, to: targetAgent.id,
+      from: rec.agent.id, to: target.id,
     });
     this.#transition(child, "open", "delegate"); // genesis rides the same primitive
     return child;
@@ -400,7 +455,7 @@ export class AgentSystem {
    *  relocate to the new holder whole; every envelope capability is
    *  REVOKED and the fact is journaled. This is not a shortfall — it is
    *  the ocap consent principle: a capability was minted by a granter
-   *  who consented to serve THIS agent's slot table; no act of the
+   *  who consented to serve THIS principal's slot table; no act of the
    *  current holder can unilaterally re-point that consent at another
    *  principal. Authority that "moved with the ticket" would be an
    *  ambient right. The new holder re-delegates explicitly
@@ -410,12 +465,12 @@ export class AgentSystem {
    *  field is not writable, and the three effects here (envelope revoke,
    *  epoch++, the fact) are the definition of the move. */
   handoff(intent, targetAgent) {
-    this.#ownAgent(targetAgent, "handoff target");
+    const target = this.#A(targetAgent, "handoff target");
     const rec = this.#R(intent);
     this.#guardLive(rec);
-    const from = rec.agent;
+    const from = AGENT_PRIV.get(rec.agent);
     from.intents.delete(intent.id);
-    targetAgent.intents.set(intent.id, intent);
+    target.intents.set(intent.id, intent);
     rec.agent = targetAgent;
     for (const { cap } of rec.envelope) {
       try { this.rt.revoke(cap); } catch { /* already dead — foreign/revoked */ }
@@ -424,7 +479,7 @@ export class AgentSystem {
     rec.envelope = []; // new holder must re-grant before it can call
     rec.ownerEpoch += 1; // HO-1: work and promises order against the epoch they were made under
     this.#fact({
-      t: "intent_handoff", intent: intent.id, from: from.id, to: targetAgent.id,
+      t: "intent_handoff", intent: intent.id, from: from.id, to: target.id,
       envelope: "revoked", slots, ownerEpoch: rec.ownerEpoch,
     });
     return intent;
@@ -437,17 +492,20 @@ export class AgentSystem {
 
   /** Resume optionally rebinds the EXECUTING MODEL: the principal,
    *  authority, context and budget survive; the "CPU" does not. A process
-   *  API cannot express this transition. */
+   *  API cannot express this transition — and the rebind is the ONLY
+   *  write path to model, because model lives in the private record and
+   *  is a read-only getter on the view. */
   resume(intent, { model = null } = {}) {
     const rec = this.#R(intent);
     this.#requireState(rec, "suspended"); // trigger guard: only a park may resume
-    if (model !== null && model !== rec.agent.model) {
-      const prev = rec.agent.model;
-      rec.agent.model = model;
-      this.#fact({ t: "agent_rebind", agent: rec.agent.id, from: prev, to: model });
+    const arec = AGENT_PRIV.get(rec.agent);
+    if (model !== null && model !== arec.model) {
+      const prev = arec.model;
+      arec.model = model;
+      this.#fact({ t: "agent_rebind", agent: arec.id, from: prev, to: model });
     }
     this.#transition(intent, "active", "resume");
-    this.#fact({ t: "intent_resume", intent: intent.id, agent: rec.agent.id });
+    this.#fact({ t: "intent_resume", intent: intent.id, agent: arec.id });
   }
 
   /** Approve with a SCOPE: the plain-data envelope of what was agreed;
@@ -465,24 +523,27 @@ export class AgentSystem {
   }
 
   /** Grant authority INTO the intent's envelope. Host presents the source
-   *  actor's control + slot and the agent's control (consent, per v1.6).
-   *  A budget membrane is attached at grant time, so the substrate — not
-   *  this layer — ultimately charges the attempts. Activation follows
-   *  SUCCESS: if grantCap refuses, the OPEN intent is untouched. */
+   *  actor's control + slot and the principal's control (consent, per
+   *  v1.6 — and the control handle is read from the PRIVATE record: it
+   *  never crosses the view boundary). A budget membrane is attached at
+   *  grant time, so the substrate — not this layer — ultimately charges
+   *  the attempts. Activation follows SUCCESS: if grantCap refuses, the
+   *  OPEN intent is untouched. */
   grantFor(intent, fromControl, fromSlot, opts = {}) {
     const rec = this.#R(intent);
     this.#guardLive(rec);
+    const arec = AGENT_PRIV.get(rec.agent);
     const slot = `intent:${intent.id}:${fromSlot}`;
     const membranes = rec.budget ? [rateLimit(rec.budget.calls)] : [];
     const cap = this.rt.grantCap(
       this.rt.holds(fromControl, fromSlot),
-      rec.agent.control,
+      arec.control,
       slot,
       { rights: opts.rights ?? ["send"], membranes }
     );
     this.#activate(intent, rec, "grant");
     rec.envelope.push({ slot, cap });
-    this.#fact({ t: "intent_grant", intent: intent.id, agent: rec.agent.id, slot, tool: fromSlot });
+    this.#fact({ t: "intent_grant", intent: intent.id, agent: arec.id, slot, tool: fromSlot });
     return slot;
   }
 
@@ -529,7 +590,7 @@ export class AgentSystem {
       // The binding fact is written in the substrate's ADMIT HOOK — after
       // the xact exists, before the handler runs, reading the private
       // record's (epoch, revision) as they stand at dispatch (CO-5).
-      const req = this.rt.request(rec.agent.control, slot, args, {
+      const req = this.rt.request(AGENT_PRIV.get(rec.agent).control, slot, args, {
         correlationId: intent.id,
         deadline: rec.deadline,
         onAdmit: (x) => {
@@ -550,9 +611,25 @@ export class AgentSystem {
     }
   }
 
+  /** Belief mutation, OWNED (S2.1b): the holder's side of context is a
+   *  read-only view; changing the current ContextVersion is an
+   *  AgentSystem act that bumps the version and journals
+   *  context_version {fromVersion, toVersion, cause}. */
+  mutateContext(intent, next) {
+    const rec = this.#R(intent);
+    this.#guardLive(rec);
+    const fromVersion = rec.context.advance(next, "mutate", undefined);
+    this.#fact({
+      t: "context_version", intent: intent.id,
+      fromVersion, toVersion: rec.context.version, cause: "mutate",
+    });
+    return rec.context.view.version;
+  }
+
   /** merge_context: a child's beliefs join the parent's lineage — accept
-   *  or reject, explicitly; the lineage records which happened. A revoked
-   *  branch contributes nothing. */
+   *  or reject, explicitly; the lineage records which happened, and an
+   *  accepted merge bumps the PARENT's version with a journaled cause.
+   *  A revoked branch contributes nothing. */
   mergeContext(childIntent, { accept = true } = {}) {
     const rec = this.#R(childIntent);
     const parent = rec.parent;
@@ -561,7 +638,14 @@ export class AgentSystem {
       throw new SubstrateError("E_STATE", "a revoked intent contributes no context");
     }
     this.#fact({ t: "intent_merge", intent: childIntent.id, into: parent.id, accept });
-    if (accept) parent.context.absorb(rec.context, childIntent.id);
+    if (accept) {
+      const prec = this.#R(parent);
+      const fromVersion = prec.context.advance(rec.context.data, "merge", childIntent.id);
+      this.#fact({
+        t: "context_version", intent: parent.id,
+        fromVersion, toVersion: prec.context.version, cause: "merge", child: childIntent.id,
+      });
+    }
     return parent.context.snapshot();
   }
 
@@ -676,8 +760,8 @@ export class AgentSystem {
     }
   }
 
-  #track(agent, intent) {
-    agent.intents.set(intent.id, intent);
+  #track(arec, intent) {
+    arec.intents.set(intent.id, intent);
     this.intents.set(intent.id, intent);
   }
 

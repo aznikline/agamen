@@ -1,6 +1,6 @@
 # APM — the Agamen Agent Process Model (normative, S2)
 
-> Status: **normative spec, rev. S2.0.4** — it stands on its own;
+> Status: **normative spec, rev. S2.0.5** — it stands on its own;
 > `src/intent.js` (S1) is its first, partial implementation. S2.0.1 closed
 > the spec-review gaps (§8 lists the six pins); S2.0.2 is the round-6
 > honesty patch: CO-5 is defined as a three-phase order (binding
@@ -10,8 +10,11 @@
 > round-7 trusted-state closure (S2.1a): ST-3's private set widened to
 > EVERY decision-relevant field plus an owning-AgentSystem brand,
 > snapshots defined as clone-then-freeze, and OPEN activation gated on
-> admitted acts — the S2.0.3 pins overstated what eight privatized
-> fields covered, and this rev states what is now actually true.
+> admitted acts; S2.0.5 is the round-8 principal/context closure
+> (S2.1b): ST-3's boundary made TRANSITIVE over the reachable object
+> graph — `intent.agent` is an inert AgentPrincipal view, context is a
+> ContextVersion stream behind owned mutation acts, and no holder-side
+> reference path reaches a mutable authority-bearing object.
 > ST-4 remains explicitly NOT claimed.
 > This file inherits the
 > vocabulary of `spec/invariants.md` and the track definitions of
@@ -181,7 +184,20 @@ ST-3  Lifecycle state is private to the model layer; principals get
       unwritable but not a snapshot. Capability tokens are the declared
       exception: opaque handles keep reference identity. The write path
       is singular: exactly one lifecycle writer exists, and the source
-      is checkable for that. [pinned in S2.1a: `every determinable
+      is checkable for that. And the boundary is TRANSITIVE: locking
+      the declared fields is not enough — it must hold over the whole
+      reachable object graph. `intent.agent` is an inert AgentPrincipal
+      VIEW (OT-0's `Identity is not execution`, applied to the API
+      surface: the execution handle, the system back-reference and the
+      intent registry are not properties of the view, and the brand
+      check reads the private RECORD, so view-tampering can never forge
+      membership); `intent.context` is a ContextVersion stream — the
+      holder sees immutable versioned snapshots, belief change is an
+      owned act journalled as `context_version`; every view instance
+      (Intent, AgentPrincipal, ContextView) is frozen at construction,
+      so no property can be bolted onto it, and no two-hop reference
+      path from a token reaches a mutable authority-bearing object.
+      [pinned in S2.1a + S2.1b: `every determinable
       field is read-only from the token`, `relations and configuration
       are decision-relevant too` (assignment to any of agent/parent/
       children/goal/budget/deadline/approval/context/id/openedAt is a
@@ -190,7 +206,12 @@ ST-3  Lifecycle state is private to the model layer; principals get
       = …` is not a handoff`, `snapshots out are frozen`, `views are
       TRUE snapshots` (nested references differ per read — clone, not
       freeze-through), `the source itself proves a single lifecycle
-      writer`]
+      writer`, `the agent view leaks no control plane` (from
+      `intent.agent` there is no property path to the substrate handle
+      or the Runtime), `the agent brand is itself unforgeable` (the
+      attack lands on `.sys`/`.control` themselves, not just on a
+      foreign object), `context is a ContextVersion stream`,
+      `transitive read-only walk`]
 ST-4  Intent transition serial order: effect dispatch, handoff, revoke
       (including each cascade leg), approval consumption,
       amend/supersede, and every lifecycle edge on one intent are
@@ -502,6 +523,27 @@ recorded a DEFERRED gap rather than a quick patch: a FAILED completion
 on the legacy (empty-contract) path may still leave candidate evidence
 in the record — the working-set commit rule lands with the COMPLETING
 skeleton (item 2); the contract branch already follows it.
+
+**S2.0.5 (round-8 principal/context closure, landed 2026-09-19 — code
+slice S2.1b)** — the review of a0a97b9 accepted ST-2 but found ST-3's
+read-only view still leaked mutable truth through REFERENCES:
+`intent.agent` handed out the writable host-plane AgentExecution
+(model/id/control writes bypassed their owned journalled paths,
+`intents.clear()` rewrote history, and `agent.sys.rt` gave any token
+holder the trusted control plane outright — branding also read the
+public-writable `agent.sys`, so membership was forgeable), and the
+context getter returned the live mutable Context, contradicting §1's
+own ContextVersion definition. Landed: the agent becomes a branded
+private record behind an inert frozen AgentPrincipal view, with brand
+checks reading the record; Context splits into private head + immutable
+versioned view, mutation only via owned `mutateContext`/`mergeContext`
+journalling `context_version {intent, fromVersion, toVersion, cause}`;
+Intent tokens are frozen instances. The lesson is recorded as ST-3's
+transitivity clause: a safety boundary over mutable authoritative state
+must hold over the whole reachable object graph, not merely over the
+declared fields. The substrate is untouched, CO-5's binding shape is
+unchanged, and ST-4 is still not claimed. This closes the trusted-state
+work — the next code slice is the COMPLETING skeleton (item 2).
 
 **S2.1 (next code, in this order — reordered after round-5 review so no
 check ever runs against mutable truth)**

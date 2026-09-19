@@ -122,12 +122,12 @@ test("fork isolates beliefs; merge accepts or rejects explicitly, lineage record
   void agent;
   const root = sys.open(agent, { goal: { outcome: "research" }, context: { facts: ["v1"] } });
   const child = sys.fork(root, { goal: { outcome: "sub-question" } });
-  child.context.mutate({ facts: ["v1", "child-learned"] });
+  sys.mutateContext(child, { facts: ["v1", "child-learned"] });
   assert.deepEqual(root.context.snapshot(), { facts: ["v1"] }); // isolated
   sys.mergeContext(child, { accept: true });
   assert.deepEqual(root.context.snapshot(), { facts: ["v1", "child-learned"] });
   const rejected = sys.fork(root);
-  rejected.context.mutate({ facts: ["denied-payload"] });
+  sys.mutateContext(rejected, { facts: ["denied-payload"] });
   sys.mergeContext(rejected, { accept: false });
   assert.deepEqual(root.context.snapshot(), { facts: ["v1", "child-learned"] }); // untouched
   const lineage = root.context.lineage.map((l) => l.event);
@@ -151,7 +151,7 @@ test("delegate creates a child on the other agent; ownership stays with the pare
   const slot = sys.grantFor(child, server, "t");
   const { result } = await sys.call(child, slot, {});
   assert.equal(result, "done");
-  assert.ok(helper.intents.has(child.id) && !boss.intents.has(child.id));
+  assert.ok(helper.hasIntent(child.id) && !boss.hasIntent(child.id));
 });
 
 test("handoff MOVES the intent but never the authority: envelope dies, new holder re-grants", async () => {
@@ -163,11 +163,11 @@ test("handoff MOVES the intent but never the authority: envelope dies, new holde
   const intent = sys.open(a1, { goal: { outcome: "carry" }, budget: { calls: 5 } });
   const slot = sys.grantFor(intent, server, "t"); // envelope installed on a1 BEFORE handoff
   await sys.call(intent, slot, { v: 1 });
-  const carriedCap = rt.holds(a1.control, slot); // the token handoff must kill
+  const carriedCap = intent.envelope[0].cap; // the token handoff must kill (view hands out the cap handle, not a1's control)
   sys.handoff(intent, a2);
   // 1. the principal-side registry follows the intent…
-  assert.equal(a1.intents.has(intent.id), false);
-  assert.equal(a2.intents.has(intent.id), true);
+  assert.equal(a1.hasIntent(intent.id), false);
+  assert.equal(a2.hasIntent(intent.id), true);
   assert.equal(intent.agent, a2);
   assert.equal(intent.spent, 1); // …and so does the budget ACCOUNTING
   // 2. …but the envelope does NOT: unilaterally relocating a grant would
@@ -581,4 +581,84 @@ test("ST-2: admission, not ambition, activates OPEN — guard-refused attempts c
   const e = evs(rt, "intent_state").at(-1);
   assert.deepEqual({ from: e.fromState, to: e.toState, v: e.stateVersion, cause: e.cause }, { from: "open", to: "active", v: 1, cause: "grant" });
   assert.equal(await asyncCode(sys.call(intent, `intent:${intent.id}:t`, {})), "E_APPROVAL"); // gate intact on the now-ACTIVE intent
+});
+
+/* ---------- S2.1b: the boundary extends over the reachable graph (round-8 blockers) ---------- */
+
+const isTE = (e) => e.name === "TypeError"; // cross-realm-safe: module-realm freezes throw THAT realm's TypeError
+
+test("ST-3: the agent view leaks no control plane — from intent.agent there is no path to Runtime", () => {
+  const { sys, intent, agent } = harness(); // registered with model "m-alpha"
+  assert.equal(intent.agent, agent); // stable principal view
+  assert.equal(agent.control, undefined); // the execution handle is not a property of the view…
+  assert.equal(agent.sys, undefined); // …so `agent.sys.rt` — the trusted control plane — does not exist
+  assert.throws(() => { agent.model = "evil-model"; }, isTE); // pre-fix: a plain field write, no agent_rebind fact
+  assert.throws(() => { agent.id = "forged"; }, isTE);
+  assert.throws(() => { agent.control = {}; }, isTE); // cannot bolt a handle onto a frozen view
+  assert.throws(() => { agent.intents = new Map(); }, isTE);
+  assert.throws(() => { agent.polluted = 1; }, isTE); // the view itself is frozen
+  assert.throws(() => agent.intentIds.push("ghost"), isTE); // registry reads are snapshots
+  assert.equal(agent.model, "m-alpha"); // none of the tampering moved truth
+  assert.deepEqual(agent.intentIds, [intent.id]);
+});
+
+test("ST-3: the agent brand is itself unforgeable — `foreign.sys = sysA` is view-tampering, not branding", () => {
+  const rtA = new Runtime();
+  const sysA = new AgentSystem(rtA);
+  const a = sysA.register("mine");
+  const rtB = new Runtime();
+  const sysB = new AgentSystem(rtB);
+  const b = sysB.register("foreign");
+  assert.throws(() => { b.sys = sysA; }, isTE); // pre-fix: `sys` was a public mutable field — this assignment WORKED
+  assert.throws(() => { b.id = a.id; }, isTE);
+  assert.ok(Object.isFrozen(b)); // nothing writable was left behind on the view for a brand to attach to
+  assert.throws(() => sysA.open(b, { goal: { outcome: "poached" } }), (e) => e.code === "E_FOREIGN");
+  const intent = sysA.open(a, { goal: { outcome: "mine" } });
+  assert.throws(() => sysA.handoff(intent, b), (e) => e.code === "E_FOREIGN"); // the brand reads the RECORD, never the view
+});
+
+test("ST-3: context is a ContextVersion stream — the view reads, the system mutates, the ledger narrates", () => {
+  const rt = new Runtime();
+  const sys = new AgentSystem(rt);
+  const a = sys.register("k", { context: { facts: ["v1"] } });
+  const root = sys.open(a, { goal: { outcome: "research" }, context: { facts: ["v1"] } });
+  assert.equal(root.context.mutate, undefined); // pre-fix: the live mutable Context leaked straight out of the read-only view
+  assert.throws(() => { root.context.snapshot().facts.push("x"); }, isTE);
+  assert.equal(root.context.version, 0);
+  sys.mutateContext(root, { facts: ["v1", "v2"] }); // belief change = owned act…
+  assert.equal(root.context.version, 1);
+  assert.deepEqual(evs(rt, "context_version").at(-1).intent, root.id); // …with its fact
+  const cv = evs(rt, "context_version").at(-1);
+  assert.deepEqual({ from: cv.fromVersion, to: cv.toVersion, cause: cv.cause }, { from: 0, to: 1, cause: "mutate" });
+  const child = sys.fork(root);
+  assert.deepEqual(child.context.snapshot(), { facts: ["v1", "v2"] }); // seeded from the CURRENT version
+  sys.mutateContext(child, { facts: ["v1", "v2", "child-learned"] });
+  sys.mergeContext(child, { accept: true });
+  assert.deepEqual(root.context.snapshot(), { facts: ["v1", "v2", "child-learned"] });
+  const mv = evs(rt, "context_version").at(-1);
+  assert.deepEqual({ intent: mv.intent, from: mv.fromVersion, to: mv.toVersion, cause: mv.cause }, { intent: root.id, from: 1, to: 2, cause: "merge" });
+  assert.deepEqual(root.context.lineage.map((l) => l.event), ["born", "mutate", "merge"]);
+  sys.revoke(child);
+  assert.throws(() => sys.mutateContext(child, { facts: ["post-mortem"] }), (e) => e.code === "E_STATE"); // terminal beliefs are frozen history
+});
+
+test("ST-3: transitive read-only walk — every reachable value is a frozen snapshot, another token, or a declared opaque handle", async () => {
+  const { sys, intent, slot, agent } = contractHarness(["flight"]);
+  const { xact } = await sys.call(intent, slot, { job: 1 }, { for: ["flight"] });
+  await sys.complete(intent, [{ xact, obligation: "flight", meta: { deep: { list: [1] } } }]);
+  assert.throws(() => { intent.polluted = 1; }, isTE); // the Intent token itself is frozen
+  const reachable = [
+    intent.goal, intent.contract[0], intent.evidence[0], intent.evidence[0].meta,
+    intent.children, intent.envelope[0], intent.context.snapshot(), intent.context.lineage[0],
+    agent, agent.intentIds, intent.parent,
+  ];
+  for (const [i, v] of reachable.entries()) {
+    if (v && typeof v === "object") assert.ok(Object.isFrozen(v), `reachable #${i} is a MUTABLE object past the boundary: ${v.constructor?.name}`);
+  }
+  // the second-order leak: no reference path to the control plane in two hops
+  assert.equal(intent.agent.sys, undefined);
+  assert.equal(intent.agent.control, undefined);
+  assert.equal(intent.parent, null);
+  // caps are the DECLARED exception — opaque handles, not data:
+  assert.ok(intent.envelope[0].cap);
 });
