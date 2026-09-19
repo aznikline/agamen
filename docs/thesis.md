@@ -37,7 +37,39 @@ Everything else — scheduling, memory, networking, model adapters — is
 *infrastructure around this core* and should stay out of the TCB unless it is
 provably part of the authority decision.
 
-## 3. Relationship to Agate
+## 3. The operating model, not just the boundary
+
+The substrate's boundary is necessary but it is not the product. The
+product is an **operating model for agency**: an answer to "what is a
+long-running, delegable, suspendable, forkable, auditable, fallible AI
+agent, as a computational object?" — in the way "process" answered that
+question for programs. The test applied to every candidate primitive:
+*if implementing it as a Linux library would behave exactly the same, it
+is not an OS primitive* (it is a library concern, and this project
+should not claim it).
+
+This splits the roadmap into two DAGs that must never be merged:
+
+- **Track S (semantic).** The shape of agency: Agent Principal,
+  Task/Intent, delegation graph, approval/attention state, context
+  lineage, fork/resume/handoff, evidence-backed completion. First
+  artifact: the Agent Process Model (`src/intent.js`, ROADMAP S1) —
+  `complete()` refusing an agent whose claim the ledger cannot back is
+  the milestone's thesis in one gate.
+- **Track E (enforcement).** Where the above must be enforced instead
+  of trusted: same-realm tokens → transports → hardened userspace →
+  agate guest → own kernel. Governed by §5's criteria below.
+
+Agamen's relationship to a kernel — including agate — lives entirely in
+track E: **Agate enforces; Agamen defines what should exist.** A
+semantic claim is never diluted to whatever is currently enforceable
+(that is how v1 got its five BLOCKERs: the enforcement gap silently
+reshaped the model); an enforcement claim is never grown beyond what a
+negative test has actually closed. The labels
+`enforced / simulated / normative` in `spec/invariants.md` are the
+mechanism that keeps the two graphs from contaminating each other.
+
+## 4. Relationship to Agate
 
 Agate (capability microkernel, same author) is the **ancestor and prior
 art**: it enforces a kernel subset of these invariants with page tables and
@@ -53,19 +85,21 @@ EL0 traps. The mapping is 1:1 on purpose:
 | `Provenance`              | audit chokepoint (spec 13 §13)       |
 
 Agamen is form-first: semantics are argued, broken, and measured in ~500
-lines of JavaScript before any of them costs a kernel ABI. Since M1.5 the
+lines of JavaScript before any of them costs a kernel ABI. Since M1.6 the
 in-realm enforcement is not merely a demonstration: the negative tests
-(`test/runtime.test.mjs`) treat hostile same-realm JS as the adversary, so
-M0/M1 are executable semantics *and* enforced semantics up to the boundary
-of the JavaScript realm. The mapping above is a migration contract, not a
-submission queue — agate is one *candidate enforcement backend* for these
-semantics (ROADMAP M5), alongside a hardened userspace runtime or,
-eventually, Agamen's own kernel. The graduation criterion is deliberately
+(`test/runtime.test.mjs`) treat realm code holding legitimate tokens as
+the adversary (the Runtime itself is the trusted control plane), so the
+milestones are executable semantics *and* enforced semantics up to the
+boundary of the JavaScript realm. The mapping above is a migration
+contract for track E only, not a submission queue — agate is one
+*candidate enforcement backend* for these semantics (ROADMAP M5),
+alongside a hardened userspace runtime or, eventually, Agamen's own
+kernel. The graduation criterion is deliberately
 narrow: a primitive earns kernel cost only when the remaining gap is
 something userspace provably cannot close (realm-crossing identity,
 preemption, atomic creation), not because the JS enforcement was inconvenient.
 
-## 4. Enforcement criteria (when a primitive moves below the substrate)
+## 5. Enforcement criteria (when a primitive moves below the substrate)
 
 A primitive becomes an *enforcement backend's obligation* (agate, a hardened
 runtime, or Agamen's own kernel — see ROADMAP M5) only when all of the
@@ -84,7 +118,7 @@ Current candidates ranked: **(a) approval lease** (atomic mint+expiry+use-count
 counters are per-closure today; a runaway needs kernel-visible accounting),
 **(c) cross-process provenance merging** (xact correlation across vspaces).
 
-## 5. Reading that shaped this
+## 6. Reading that shaped this
 
 - M. Miller, *Robust Composition* (2006) — ocap, membranes, the confused deputy.
 - G. Agha, *Actors* (1986) — the computational form.

@@ -1,11 +1,13 @@
 # Agamen Evaluation Charter — a quantitative approach to the substrate
 
 Agamen's thesis is that cost decides which primitive belongs below the
-mediation boundary (`docs/thesis.md` §4, M5). A thesis without numbers is a
+mediation boundary (`docs/thesis.md` §5, M5). A thesis without numbers is a
 style. This charter fixes *what* we measure, *how* we aggregate, and *which
 fallacies* disqualify a result — methodology adapted from Hennessy &
 Patterson, *Computer Architecture: A Quantitative Approach* (knowledge
-center, "OS" notebook).
+center, "OS" notebook). Scope: these rules govern **track E** measurements;
+track S milestones (S1/S2) are judged by `spec/` acceptance tests, not by
+ns/call — S1's `intent.js` overhead is deliberately not fitted here.
 
 ## 1. What is measured
 
@@ -41,9 +43,16 @@ that smuggles in machine-dependent constants.
 ## 3. Aggregation rules
 
 - **Rates (calls/s) → harmonic mean** of per-run times; **totals (ns/call,
-  throughput over one workload) → arithmetic mean**; report the median
-  alongside whenever variance across runs exceeds 15%. A single mean of
-  mixed ratios is an automatic reject in review.
+  throughput over one workload) → arithmetic mean** as the headline;
+  report the median alongside whenever variance across runs exceeds 15%.
+  A single mean of mixed ratios is an automatic reject in review.
+- **A/B comparisons are per-replicate paired** (M1.6 protocol): journal
+  and no-journal variants of a pair run the identical workload in the
+  *same round* against fresh runtimes, rounds are interleaved
+  round-robin across all variants, odd rounds execute in reversed
+  order, and the reported delta is over same-round-index samples
+  (Δmean, Δmedian, ratio). Pass-level or best-of-N comparisons are not
+  admissible for audit-share claims.
 - Each benchmark runs ≥ 10 iterations after warmup; discard the first 10%;
   report max too — tail latency is a *security* property under deadline
   semantics (M1), not just performance trivia.

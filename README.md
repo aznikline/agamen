@@ -5,14 +5,19 @@
 Agamen is an independent evolution of the *agent-substrate* experiment: a
 form for running mutually suspicious, nondeterministic agents that is
 deliberately **not an operating system in the classical sense**. Its
-normative core is a deterministic boundary — capabilities, stamped identity,
-membranes, provenance — with hardware enforcement deferred to a pluggable
-backend decision ([ROADMAP](ROADMAP.md) M5).
+normative core is a deterministic boundary — capabilities, stamped
+identity, membranes, provenance — with hardware enforcement deferred to
+a pluggable backend decision ([ROADMAP](ROADMAP.md) M5). The project runs
+on two tracks: the **semantic track** defines the operating model for
+agency (what should exist — [S1: the Agent Process
+Model](src/intent.js)); the **enforcement track** hardens it (where it
+must be enforced). Agate *enforces*; Agamen *defines what should exist*.
 
-> Status: **M1.5** — v1.5 hardened substrate: invariants enforced against
-> hostile same-realm JS (opaque WeakMap-backed tokens, fully mediated
-> messaging, honest cancellation/tick liveness), 32 tests, Node ≥ 20,
-> dependency-free.
+> Status: **M1.6** — v1.6 substrate: authority-handle split (ActorId /
+> ActorControl / MailboxCap), consent-gated slots, clone-or-fail value
+> discipline, private hash-chained ledger; 49 invariant + 13 APM tests;
+> Node ≥ 20, dependency-free. M2 (approval leases) stays blocked by
+> design.
 > [Why "Agamen"?](docs/name.md) · [Design thesis](docs/thesis.md) ·
 > [Invariants (normative)](spec/invariants.md) · [Evaluation charter](docs/evaluation.md) · [Roadmap](ROADMAP.md)
 
@@ -47,23 +52,30 @@ rt.grant(server, "search", agent, "search", {
 
 await rt.invoke(agent, "search", { q: "capability revocation" });
 rt.revoke(rt.holds(server, "search")); // kills every derived cap instantly (#6)
-rt.journal.verify(); // chain is hash-consistent for this process lifetime
+rt.verifyJournal(); // chain is hash-consistent for this process lifetime
 ```
 
-Tokens are opaque: a capability/actor is a frozen `{id}` whose authority
-state lives in runtime-private WeakMaps, so holder-side code — even hostile
-same-realm JS — cannot forge rights, un-revoke, drop membranes, or reach the
-target. Values cross principals by structured clone, never shared reference.
+Principals are reached by three distinct handles (v1.6): the **ActorId**
+(a frozen `{id, label}` snapshot from `identityOf` — displayable,
+comparable, accepted by no privileged call), the **ActorControl** (the
+principal's controller: `recv`/`request`/`holds`/slot writes), and
+**MailboxCap** capabilities (the only authority to `tell`). Authority
+state lives in runtime-private WeakMaps, so realm code — even hostile
+same-realm JS holding legitimate tokens — cannot forge rights, un-revoke,
+drop membranes, or install into a slot without the target's consent.
+Values cross principals by structured clone in both directions; a
+result that cannot clone FAILS the transaction (`E_CLONE`).
 
-Messaging is capability-gated too (#3): holding an actor reference is not
-authority to mail it. The mailbox root cap comes from `address()` and is
-distributed by attenuation:
+Messaging is capability-gated too (#3): a public identity is not
+authority to mail its owner. The mailbox root cap comes from `address()`
+— which requires the target's control handle, i.e. the host's consent —
+and is distributed by attenuation:
 
 ```js
 const worker = rt.spawn("worker", { mailbox: 8, onFull: "block" });
-rt.grantCap(rt.address(worker), agent, "worker-mbox", { rights: ["send"] });
-rt.tell(agent, worker, { job: "index" });   // E_RIGHTS without the cap
-const got = rt.recv(worker);                // { sender, msg, xact } — stamped, cloned
+const mbox = rt.grantCap(rt.address(worker), agent, "worker-mbox", { rights: ["send"] });
+rt.tell(agent, mbox, { job: "index" }); // E_RIGHTS without the cap
+const got = rt.recv(worker);            // { sender, msg, xact } — stamped, cloned
 ```
 
 Scheduling is substrate state, not a convention — an expired request never
@@ -78,24 +90,46 @@ rt.tick();         // host-driven clock sweep: expires queued work
 // outcomes in the journal: ok | fail | cancelled | timeout; queue: shed | expire
 ```
 
-The journal cannot be switched off. `new Runtime({ bench: true })` swaps in
-a constant-time, **non-conforming** audit sink for cost-model fitting only;
-events are still generated and `rt.conforming === false` flags the deviation.
+The journal cannot be switched off or reached: it is a private sink, and
+`verifyJournal()` / `journalEntries()` (snapshot copies) are the only
+views. `new Runtime({ bench: true })` swaps in a constant-time,
+**non-conforming** audit sink for cost-model fitting only; events are
+still generated and the `rt.conforming` getter reports the deviation.
+
+## Agent Process Model (S1 experiment, `src/intent.js`)
+
+The semantic track's first artifact: `AgentExecution` (a principal that
+survives model rebinds) and `Intent` (goal + authority envelope + budget
++ deadline + approval state + context lineage) with fork / delegate /
+handoff / suspend / resume(model) / approve / revoke / merge_context /
+complete(evidence). Enforcement stays in the substrate; the layer owns
+lifecycle facts — and the gate is provable:
+
+```js
+const sys = new AgentSystem(rt);
+const planner = sys.register("planner", { model: "m-alpha" });
+const intent = sys.open(planner, { goal: { outcome: "report" }, budget: { calls: 10 } });
+const slot = sys.grantFor(intent, server, "search"); // envelope cap, budget membrane
+const { xact, result } = await sys.call(intent, slot, { q: "…" });
+await sys.complete(intent, [{ xact }]); // refuses unless the ledger backs the xact
+```
 
 ## Layout
 
 ```
 src/runtime.js                     the substrate (actors/caps/membranes/journal/schedule)
-test/runtime.test.mjs              invariant suite
-bench/run.mjs                      tier 1-2 measurement harness
-bench/baseline.md                  fitted per-invoke cost model (M1.5 snapshot)
+src/intent.js                      S1: the Agent Process Model experiment (Track S)
+test/runtime.test.mjs              invariant suite (49 tests)
+test/intent.test.mjs               APM lifecycle + negative suite (13 tests)
+bench/run.mjs                      tier 1-2 measurement harness (paired protocol)
+bench/baseline.md                  fitted per-invoke cost model (M1.6 snapshot)
 spec/invariants.md                 normative invariants + threat model + acceptance
                                    (inherited from agate spec 13, ids preserved)
 kernel/uapi/                       reference ABI seed (capability rights algebra)
 docs/name.md                       the Agamemnon case
-docs/thesis.md                     the form, and the backend question
+docs/thesis.md                     the form, the two tracks, and the backend question
 docs/evaluation.md                 measurement charter (quantitative method)
-ROADMAP.md                         M0–M5
+ROADMAP.md                         Track S (S0–S2) and Track E (M0–M5)
 ```
 
 ## Relationship to Agate
@@ -104,8 +138,9 @@ ROADMAP.md                         M0–M5
 microkernel that proved invariants #1/#2/#6/#10 are enforceable with page
 tables and EL0 traps. Agamen inherits its normative core (same invariant
 numbering), cites it as prior art, and treats it as one candidate enforcement
-backend (M5b) — not the destination. Agate stays its own project; nothing in
-this repo is required of it.
+backend (M5b) — not the destination. The division of labor in one line:
+**Agate enforces; Agamen defines what should exist.** Agate stays its own
+project; nothing in this repo is required of it.
 
 ## License
 
