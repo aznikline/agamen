@@ -792,3 +792,100 @@ test("ST-2: an attempted prototype-id spoof cannot misattribute a transition —
   assert.equal(st, "failed"); // replay == private view, under the canonical id
   assert.equal(intent.state, "failed");
 });
+
+/* ---------- S2.2a: COMPLETING pre-works — JSON-safe domain + detached
+ * ContextVersion (round-11 directive, spec §8 item 2 pre-works a & b).
+ * Provenance hashes events by JSON shape, so "cloneable" was never
+ * "representable": Map/Set/class instances clone but serialize to {},
+ * cycles clone but explode inside record(). And the old String(v)
+ * escape hatch meant a hostile toString could EXECUTE while escaping a
+ * denial fact — or throw, and the fact would simply vanish. ---------- */
+
+test("S2.2a domain: Map/bigint/cycle/function/accessor/undefined/class-instance cannot enter authoritative state; refusals change no truth and no ledger", () => {
+  const rt = new Runtime();
+  const sys = new AgentSystem(rt);
+  const a = sys.register("d1");
+  const isDomain = (e) => e.code === "E_DOMAIN";
+  assert.throws(() => sys.open(a, { goal: new Map([["k", "v"]]) }), isDomain); // clones fine, hashes as {} — exactly the gap
+  assert.throws(() => sys.open(a, { goal: { o: 1n } }), isDomain); // bigint: JSON.stringify THROWS on it
+  const cyc = { o: "x" }; cyc.self = cyc;
+  assert.throws(() => sys.open(a, { goal: cyc }), isDomain); // cycle: no JSON binding
+  assert.throws(() => sys.open(a, { goal: { o: 1 }, budget: { calls: new Date() } }), isDomain);
+  assert.throws(() => sys.open(a, { goal: { o: 1, bad: (x) => x } }), isDomain);
+  assert.throws(() => sys.open(a, { goal: { o: 1 }, approval: { get trap() { throw new Error("getter-ran"); } } }), isDomain); // inspection must not execute
+  assert.throws(() => sys.open(a, { goal: { o: 1, u: undefined } }), isDomain); // silently dropped by cloning — now refused
+  class Belief { constructor() { this.b = 1; } }
+  assert.throws(() => sys.open(a, { goal: { o: 1, b: new Belief() } }), isDomain); // structuredClone ACCEPTS this — that's the point
+  assert.throws(() => sys.open(a, { goal: { o: 1, f: Infinity } }), isDomain); // non-finite number
+  // shared (DAG) references are NOT cycles — legal, and cloned apart:
+  const shared = { n: 1 };
+  const intent = sys.open(a, { goal: { o: "ok", x: shared, y: shared }, context: { list: [shared, shared] } });
+  assert.equal(intent.state, "open");
+  const before = rt.journalEntries().length;
+  assert.throws(() => sys.mutateContext(intent, new Set([1])), isDomain);
+  assert.throws(() => sys.mutateContext(intent, { a: NaN }), isDomain);
+  assert.equal(intent.context.version, 0); // refusal bumped no belief version
+  assert.equal(intent.state, "open");
+  assert.equal(evs(rt, "intent_open").length, 1); // the refused opens wrote NO genesis fact
+  assert.equal(rt.journalEntries().length, before); // refusals are silent on the ledger — nothing half-written
+  assert.equal(rt.verifyJournal(), true);
+});
+
+test("S2.2a sanitization: a hostile toString cannot suppress a denial fact — facts are rebuilt, never converted", async () => {
+  const { rt, sys, intent, slot } = contractHarness(["flight"]);
+  await sys.call(intent, slot, { job: 1 }, { for: ["flight"] });
+  const claim = {
+    xact: "x999-forged", obligation: "flight",
+    evil: function nope() {}, // pre-fix: uncloneable → String(claim) → runs the hostile conversion
+    toString() { throw new Error("boom"); },
+    get trap() { throw new Error("getter-ran"); }, // pre-fix: the clone READS it — attacker code executed on the fact path
+  };
+  // pre-fix: complete() dies inside String(claim) — Error("boom"), and
+  // the completion_denied fact NEVER lands: a hostile object erased the
+  // audit trail of its own refusal.
+  assert.equal(await asyncCode(sys.complete(intent, [claim])), "E_NO_EVIDENCE");
+  const d = evs(rt, "completion_denied").at(-1);
+  assert.ok(d, "the denial fact must land no matter what the claim object wants");
+  assert.equal(d.claim.evil.$notInDomain, "function");
+  assert.equal(d.claim.toString.$notInDomain, "function");
+  assert.equal(d.claim.trap.$notInDomain, "accessor");
+  assert.equal(d.claim.xact, "x999-forged"); // in-domain parts stay honest
+  assert.equal(d.claim.obligation, "flight");
+  assert.equal(rt.verifyJournal(), true);
+  assert.equal(intent.state, "active"); // refused completion changed nothing
+});
+
+test("S2.2a sanitization: out-of-domain fact payloads become fixed markers — nothing attacker-run executes, the hash still binds", () => {
+  const { rt, sys, intent } = contractHarness(["flight"]);
+  const reason = { note: "ok", f: () => {}, n: 1n, when: new Date(0), nested: [{ bad: undefined }] };
+  sys.fail(intent, reason); // pre-fix: the whole reason degraded to String(reason) = "[object Object]"
+  const f = evs(rt, "intent_fail").at(-1);
+  assert.equal(f.reason.note, "ok");
+  assert.equal(f.reason.f.$notInDomain, "function");
+  assert.equal(f.reason.n.$notInDomain, "bigint");
+  assert.equal(f.reason.when.$notInDomain, "non-plain"); // Date was LIVE in the ledger pre-fix
+  assert.equal(f.reason.nested[0].bad.$notInDomain, "undefined");
+  assert.equal(rt.verifyJournal(), true);
+});
+
+test("S2.2a context: current() hands out a DETACHED ContextVersion — v3 stays v3 while the head walks to v5", () => {
+  const rt = new Runtime();
+  const sys = new AgentSystem(rt);
+  const a = sys.register("d4", { context: { belief: "v0" } });
+  const intent = sys.open(a, { goal: { o: 1 }, context: { belief: "v0" } });
+  const v0 = intent.context.current(); // pre-fix: ContextView had no current() — only a live cursor
+  assert.deepEqual(Object.keys(v0).sort(), ["lineageRef", "snapshot", "version"]); // spec §1's shape, verbatim
+  sys.mutateContext(intent, { belief: "v1" });
+  sys.mutateContext(intent, { belief: "v2" });
+  assert.equal(intent.context.version, 2);
+  assert.equal(v0.version, 0); // the head moved; the VALUE did not
+  assert.deepEqual(v0.snapshot, { belief: "v0" });
+  assert.equal(Object.isFrozen(v0) && Object.isFrozen(v0.snapshot) && Object.isFrozen(v0.lineageRef), true);
+  assert.throws(() => { v0.snapshot.belief = "rewritten"; }, isTE);
+  assert.equal(v0.lineageRef.length, 1); // lineage pinned at birth too
+  const v2 = intent.context.current();
+  assert.equal(v2.version, 2);
+  assert.notEqual(v2.snapshot, v0.snapshot); // distinct detached values — a context obligation binds ONE
+  assert.equal(v2.lineageRef.at(-1).toVersion, 2);
+  assert.equal(rt.verifyJournal(), true);
+});

@@ -1,6 +1,6 @@
 # APM — the Agamen Agent Process Model (normative, S2)
 
-> Status: **normative spec, rev. S2.0.7** — it stands on its own;
+> Status: **normative spec, rev. S2.0.8** — it stands on its own;
 > `src/intent.js` (S1) is its first, partial implementation. S2.0.1 closed
 > the spec-review gaps (§8 lists the six pins); S2.0.2 is the round-6
 > honesty patch: CO-5 is defined as a three-phase order (binding
@@ -22,7 +22,11 @@
 > round-10 prototype closure (S2.1d): the boundary now covers the
 > BEHAVIOR surface — view prototypes are frozen, and authoritative
 > identity is record data that internal code never reads through a
-> presentation getter.
+> presentation getter; S2.0.8 is the round-11 COMPLETING floor
+> (S2.2a): authoritative state speaks one JSON-safe plain-data domain,
+> facts are SANITIZED into fixed structures — never converted through
+> attacker-controlled code — and a ContextVersion handed out by the
+> view is a detached value, not a cursor.
 > ST-4 remains explicitly NOT claimed.
 > This file inherits the
 > vocabulary of `spec/invariants.md` and the track definitions of
@@ -64,7 +68,12 @@ approval state (§6), delegation edges (§4), evidence list (§3),
 **ContextVersion** — immutable belief snapshot; a lineage of
 `born / mutate / merge` events; merge is two-headed (absorb records the
 contributing intent and accept/reject verdict). Beliefs are data, never
-authority.
+authority. It is a VALUE, not a cursor: `{version, snapshot,
+lineageRef}` — read v3 and it stays v3 even after the head walks to v5
+(pinned S2.2a by `context: current() hands out a DETACHED
+ContextVersion`); a context obligation binds this value, never a live
+view that quietly changes under it. Its data belongs to the JSON-safe
+plain-data domain (ST-3).
 
 **AuthorityEnvelope** — the set of capability grants an intent has
 earned *at its current owner's slot table*, each derived in the
@@ -187,7 +196,7 @@ ST-3  Lifecycle state is private to the model layer; principals get
       the revoke cascade, `agent = …` is a handoff with no envelope
       kill, no epoch++, no fact), and "frozen/append-only" remains an
       API convention, not a property. Views out are TRUE snapshots:
-      structuredClone THEN deep-freeze — freeze-only paths freeze the
+      deep-copy THEN deep-freeze — freeze-only paths freeze the
       record's own nested objects through shared references, which is
       unwritable but not a snapshot. Capability tokens are the declared
       exception: opaque handles keep reference identity. The write path
@@ -225,6 +234,29 @@ ST-3  Lifecycle state is private to the model layer; principals get
       resolves ids through the records, never through a presentation
       getter, so even a hypothetical getter rewrite could not
       misattribute a fact. The public getters are presentation only.
+      And the state LANGUAGE is a frozen JSON-safe plain-data domain
+      (S2.2a): allow null | boolean | finite number | string |
+      array<value> | plain object<string, value>; refuse undefined |
+      bigint | NaN | Infinity | function | symbol | Date | Map | Set |
+      typed arrays | class instances | cycles. The domain is defined
+      independently of any copier — "cloneable" is NOT "representable":
+      structuredClone happily accepts a Map and a BigInt, and under
+      JSON-shaped provenance hashing the Map serializes to `{}` (two
+      different beliefs, one hash binding) while the BigInt throws
+      inside `record()`. Out of domain, the two sanctioned responses
+      are refuse or sanitize, and NEVER a conversion the value itself
+      controls: no `String(v)`, no `toString`, no `Symbol.toPrimitive`,
+      no getter is ever executed while owning or sanitizing a value —
+      a hostile object's throwing conversion must not be able to
+      suppress the denial fact of its own refusal. Ingress refuses
+      (E_DOMAIN) before any write; the fact path rebuilds each value
+      structurally, replacing unrepresentable leaves with fixed
+      markers, so the fact always lands and its hash binds its
+      content. Authoritative records are built by a same-realm
+      structural copier, so exotic-realm artifacts never sit under the
+      plain check either. In full, the boundary is: private state +
+      branded ownership + no aliases out + no aliases in + immutable
+      behavior surface + one JSON-safe value domain.
       [pinned in S2.1a + S2.1b +
       S2.1c + S2.1d: `every determinable
       field is read-only from the token`, `relations and configuration
@@ -249,7 +281,17 @@ ST-3  Lifecycle state is private to the model layer; principals get
       values`, `the view prototypes are frozen`,
       `an attempted prototype-id spoof cannot misattribute a
       transition` (private truth, ledger attribution and replay stay
-      in agreement even when the presentation getter is attacked)]
+      in agreement even when the presentation getter is attacked),
+      `S2.2a domain: Map/bigint/cycle/function/accessor/undefined/
+      class-instance cannot enter authoritative state; refusals change
+      no truth and no ledger` (refused opens journal no genesis fact;
+      the ledger does not grow during refusals at all), `S2.2a
+      sanitization: a hostile toString cannot suppress a denial fact`
+      (the refusal fact lands with fixed markers; pre-fix the
+      conversion threw and the audit trail vanished), `S2.2a
+      sanitization: out-of-domain fact payloads become fixed markers`,
+      `S2.2a context: current() hands out a DETACHED ContextVersion`
+      (v3 stays v3 while the head walks to v5)]
 ST-4  Intent transition serial order: effect dispatch, handoff, revoke
       (including each cascade leg), approval consumption,
       amend/supersede, and every lifecycle edge on one intent are
@@ -636,6 +678,31 @@ binds exotic values like two different Maps to the same bytes). With
 this, the trusted-state closure is declared FINISHED: the next slice
 is COMPLETING, unconditionally.
 
+**S2.0.8 (round-11 COMPLETING floor, landed 2026-09-20 — code slice
+S2.2a)** — the review of 7073c21 SIGNED the trusted-state closure
+("APPROVE ST-2 + ST-3") and directed the first COMPLETING steps without
+another closure round. Landed, in the nailed order: (a) the JSON-safe
+plain-data domain is now the normative value language of ST-3 —
+defined against provenance's JSON-shaped hashing, not against
+structuredClone, because "cloneable" and "representable" only coincide
+by luck; ingress refuses exotic values (E_DOMAIN) before any write,
+and the fact path sanitizes structurally. The round-11 MAJOR died with
+it: `ownValue`'s `String(v)` fallback EXECUTED attacker code
+(malicious `toString` / `Symbol.toPrimitive`, and a clone that merely
+READS a throwing getter) and could make a denial fact vanish mid-
+refusal; facts are now rebuilt from own data descriptors with fixed
+`{$notInDomain, tag}` markers — the conversion is never the value's
+job. (b) `context.current()` returns the detached ContextVersion
+VALUE (`{version, snapshot, lineageRef}`), closing the round-9 MAJOR
+that a context obligation would otherwise have bound to a live cursor.
+One implementation note the domain made necessary: authoritative
+ingress clones with a same-realm structural copier, not
+`structuredClone`, because a host-realm clone is precisely the
+realm-mismatched artifact the plain check refuses. This was still
+trusted-state work — the COMPLETING machinery proper (ST-1 check
+state, four obligation kinds, matcher, DC-5) is the next slice;
+substrate untouched, no new DEP, ST-4 unclaimed.
+
 **S2.1 (next code, in this order — reordered after round-5 review so no
 check ever runs against mutable truth)**
 
@@ -652,22 +719,20 @@ check ever runs against mutable truth)**
    plus the WORKING-SET COMMIT RULE for candidate evidence (claims are
    verified against a temporary set; `rec.evidence` changes only at
    COMPLETING → COMPLETED; denials mutate no truth — closes the
-   round-7 deferred gap on the legacy path); plus the ROUND-9/10
-   PRE-WORKS, required because the `context` obligation reads them,
+   round-7 deferred gap on the legacy path; APPLIED EARLY to both
+   completion paths by S2.2a — claims validate and domain-own before
+   any evidence write; what remains is the explicit COMPLETING
+   check-state itself); plus the ROUND-9/10 PRE-WORKS, required because the `context` obligation reads them,
    in this fixed order (round-10: 先冻域，再造值，最后四种 obligation —
    do not reverse it):
-   (a) first, the PLAIN-DATA SNAPSHOT DOMAIN — Map/Set/Date/class
-       instances are structured-cloneable but freezeDeep gives them no
-       immutable semantics (poisoning any `Object.isFrozen` oracle),
-       AND worse: provenance hashes events via JSON shape, so
-       `new Map([["x",1]])` and `new Map([["totallyDifferent",999]])`
-       both serialize to `{}` — an exotic value in a fact already
-       breaks hash-content binding, and a cycle can throw inside
-       `record()` itself. Refuse exotic values at the APM door;
-   (b) then immutable per-version ContextVersion VALUES — today's
-       ContextView is a read-only LIVE cursor (version/snapshot track
-       the head), so completion evidence must bind a detached
-       `{version, snapshot, lineage-ref}` value, not a moving view;
+   (a) ~~first, the PLAIN-DATA SNAPSHOT DOMAIN~~ LANDED (S2.2a) — the
+       domain above; exotic values are refused at the APM door and
+       sanitized on the fact path, with no attacker-controlled
+       conversion ever executed;
+   (b) ~~then immutable per-version ContextVersion VALUES~~ LANDED
+       (S2.2a) — `context.current()` hands out a detached
+       `{version, snapshot, lineageRef}` value; the completion evidence
+       for a `context` obligation binds that value, not a moving view;
    (c) only then the four obligation kinds;
 3. closure negative gate first, as a test before the feature (DC-5);
 4. ~~dispatch-time binding~~ LANDED (CO-5 pinned by the temporal test;

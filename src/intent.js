@@ -29,7 +29,16 @@
  * (intent id, principal id) is record data: internal code resolves
  * ids through PRIV/AGENT_PRIV and never through a presentation getter,
  * so even a hypothetical getter rewrite could not misattribute a
- * single ledger fact.
+ * single ledger fact. S2.2a gives COMPLETING its floor: authoritative
+ * state speaks one JSON-safe plain-data domain (plain objects, arrays,
+ * strings, booleans, finite numbers, null — no Map/Set/Date/class/
+ * bigint/function/symbol/cycle can enter a record or a fact, because
+ * provenance hashes by JSON shape), facts are SANITIZED into fixed
+ * marker structures rather than converted with attacker-controlled
+ * String()/getters (a hostile toString can no longer make a denial
+ * fact vanish), and a ContextVersion handed out by `context.current()`
+ * is a truly detached value: read v3 and it stays v3 while the head
+ * walks on to v5.
  *
  * The private record of an Intent holds EVERY decision-relevant field —
  * relations (agent, parent, children), configuration (goal, budget,
@@ -39,7 +48,7 @@
  * an intent's state is defined by exactly one ledger, and any other
  * system touching it is refused (E_FOREIGN) before it can write a fact
  * into the wrong place. Views out are true immutable snapshots
- * (structuredClone + deepFreeze; capability tokens keep reference
+ * (plainClone + deepFreeze; capability tokens keep reference
  * identity — they are opaque handles, not data to copy), and every
  * lifecycle edge rides one transition primitive (spec ST-2) journaling
  * {intent, fromState, toState, stateVersion, cause}. OPEN activates only
@@ -102,8 +111,11 @@ function normalizeContract(list) {
   for (const raw of list) {
     let ob;
     try {
-      ob = typeof raw === "string" ? { id: raw } : structuredClone(raw);
-    } catch {
+      ob = typeof raw === "string" ? { id: raw } : cloneContext(raw, "obligation");
+    } catch (e) {
+      // E_INVAL for shape, E_DOMAIN for a non-JSON-safe obligation — either
+      // way the whole contract is refused before any state exists.
+      if (e.code === "E_DOMAIN") throw e;
       throw new SubstrateError("E_INVAL", "obligations must be plain data");
     }
     const id = ob?.id;
@@ -138,12 +150,74 @@ function normalizeContract(list) {
  * is `mutateContext`/`mergeContext` — an AgentSystem act journalling
  * context_version {fromVersion, toVersion, cause}. */
 
-function cloneContext(data) {
-  try {
-    return structuredClone(data);
-  } catch {
-    throw new SubstrateError("E_CANON", "context data must be structurally cloneable");
+/* ---------- the JSON-safe plain-data domain (S2.2a, spec §8 item 2 pre-work a) ----------
+ * Provenance hashes events by their JSON shape, so "structurally
+ * cloneable" is NOT good enough for authoritative state: a Map and a
+ * Set both clone fine and both serialize to {} — two different beliefs
+ * with one hash binding; a cycle clones but throws inside record(),
+ * after the seq number is consumed. The domain is therefore frozen
+ * independently of structuredClone:
+ *   allow: null | boolean | finite number | string | array<value> |
+ *          plain object<string,value>
+ *   refuse: undefined | bigint | NaN | Infinity | function | symbol |
+ *           Date | Map | Set | typed arrays | class instances | cycles
+ * The walk reads only own DATA descriptors (an accessor would execute
+ * attacker code the moment it is inspected) and never touches
+ * v.constructor / Symbol.toStringTag (attacker-controlled), so the
+ * verdict — and the fixed message — comes from structure alone.
+ * Cycles are refused by path membership, so shared (DAG) references
+ * stay legal. */
+function checkDomain(v, seen, what) {
+  if (v === null || typeof v === "string" || typeof v === "boolean") return;
+  if (typeof v === "number") {
+    if (!Number.isFinite(v)) throw new SubstrateError("E_DOMAIN", `${what}: numbers must be finite — NaN/Infinity have no JSON binding`);
+    return;
   }
+  if (typeof v !== "object") {
+    throw new SubstrateError("E_DOMAIN", `${what}: '${typeof v}' has no JSON binding — undefined/bigint/function/symbol are refused at the door`);
+  }
+  if (seen.has(v)) throw new SubstrateError("E_DOMAIN", `${what}: cycles have no JSON binding`);
+  if (!Array.isArray(v)) {
+    const proto = Object.getPrototypeOf(v);
+    if (proto !== Object.prototype && proto !== null) {
+      throw new SubstrateError("E_DOMAIN", `${what}: plain objects and arrays only — Date/Map/Set/class instances have no stable JSON binding`);
+    }
+  }
+  seen.add(v);
+  for (const [key, prop] of Object.entries(Object.getOwnPropertyDescriptors(v))) {
+    if ("get" in prop || "set" in prop) {
+      throw new SubstrateError("E_DOMAIN", `${what}.${key}: accessor properties are refused — reading them executes attacker code`);
+    }
+    checkDomain(prop.value, seen, `${what}.${key}`);
+  }
+  seen.delete(v);
+}
+
+/* The domain makes a hand-rolled copier possible and provably faithful:
+ * after checkDomain, a value is ONLY null/boolean/string/finite-number/
+ * array/plain-object with own data props and no cycles, so rebuilding
+ * bottom-up IS the deep clone. structuredClone is deliberately NOT used
+ * for authoritative ingress: its output carries the host realm's
+ * prototypes, and a realm-mismatched object is exactly what the plain
+ * check refuses — records built from structuredClone clones would fail
+ * their own domain on re-entry. plainClone keeps every stored value in
+ * THIS realm, structurally plain by construction. */
+function plainClone(v) {
+  if (v === null || typeof v !== "object") return v;
+  if (Array.isArray(v)) return v.map(plainClone);
+  const out = {};
+  for (const [k, prop] of Object.entries(Object.getOwnPropertyDescriptors(v))) {
+    out[k] = plainClone(prop.value); // data props only — checkDomain already refused accessors
+  }
+  return out;
+}
+
+/* Ingress for anything that lands in an authoritative record: refuse out
+ * of domain, then deep-copy so no caller alias survives. (The domain
+ * check also guarantees the copy cannot fail here.) */
+function cloneContext(data, what = "value") {
+  checkDomain(data, new WeakSet(), what);
+  return plainClone(data);
 }
 
 function freezeDeep(v) {
@@ -158,34 +232,50 @@ function freezeDeep(v) {
  * freeze-only path (shallow spread + freezeDeep) would freeze the
  * private record's own nested objects through a shared reference, which
  * is "unwritable" but not the claimed "immutable snapshot clone".
+ * Only ever called on record data, which the domain check has already
+ * made cloneable (S2.2a) — no fallback branch is reachable here.
  * Callers that must preserve opaque handles (envelope caps) do NOT route
  * those through here. */
 function snapshot(v) {
   if (v === null || typeof v !== "object") return v;
-  try {
-    return freezeDeep(structuredClone(v));
-  } catch {
-    throw new SubstrateError("E_CANON", "snapshot data must be structurally cloneable");
-  }
+  return freezeDeep(plainClone(v));
 }
 
-/* INGRESS ownership (S2.1c, round-9 BLOCKER): the egress boundary says
- * no mutable alias LEAVES; this one says no caller-owned alias ENTERS
- * authoritative state or the ledger. Provenance does not clone events,
- * so handing rt.record() a caller reference keeps that reference inside
- * an already-hashed event — mutate through it afterwards and you have
- * rewritten the history verifyJournal() reads. Every fact is deep-copied
- * per value on its way in; a non-cloneable payload (a denial claim
- * carrying a function) degrades to its String form, never to a live
- * reference. Record-side ingress uses the strict copiers (cloneContext /
- * structuredClone or E_INVAL/E_CANON), never this lossy fallback. */
-function ownValue(v) {
-  if (v === null || typeof v !== "object") return v;
-  try {
-    return structuredClone(v);
-  } catch {
-    return String(v);
+/* INGRESS ownership (S2.1c, round-9 BLOCKER; sanitizer hardened by
+ * S2.2a, round-11 MAJOR): the egress boundary says no mutable alias
+ * LEAVES; this one says no caller-owned alias ENTERS authoritative state
+ * or the ledger. Provenance does not clone events, so handing
+ * rt.record() a caller reference keeps that reference inside an
+ * already-hashed event — mutate through it afterwards and you have
+ * rewritten the history verifyJournal() reads. Every fact value is
+ * re-built bottom-up from its own descriptors (getters are never
+ * invoked, `String(v)` is never called — an attacker's toString /
+ * Symbol.toPrimitive may execute or throw, and a THROWING conversion
+ * used to be able to erase the denial fact it was escaping). In-domain
+ * content is kept as a structural copy; anything outside the domain
+ * becomes a FIXED marker — the fact always lands, and it lands honest
+ * about what could not be represented. Record-side ingress uses the
+ * strict copier (cloneContext), never this lossy path. */
+function factValue(v, seen = new WeakSet()) {
+  if (v === null || typeof v === "string" || typeof v === "boolean") return v;
+  if (typeof v === "number") return Number.isFinite(v) ? v : { $notInDomain: "non-finite number" };
+  if (typeof v !== "object") return { $notInDomain: typeof v }; // undefined | bigint | function | symbol
+  if (seen.has(v)) return { $notInDomain: "cycle" };
+  if (!Array.isArray(v)) {
+    const proto = Object.getPrototypeOf(v);
+    if (proto !== Object.prototype && proto !== null) return { $notInDomain: "non-plain" }; // Date/Map/Set/class/typed array — no conversion is attempted
+    seen.add(v);
+    const out = {};
+    for (const [key, prop] of Object.entries(Object.getOwnPropertyDescriptors(v))) {
+      out[key] = "get" in prop || "set" in prop ? { $notInDomain: "accessor" } : factValue(prop.value, seen);
+    }
+    seen.delete(v);
+    return out;
   }
+  seen.add(v);
+  const out = v.map((x) => factValue(x, seen));
+  seen.delete(v);
+  return out;
 }
 
 class ContextHead {
@@ -195,13 +285,13 @@ class ContextHead {
   view;
 
   constructor(data = {}, seed = "root") {
-    this.data = cloneContext(data);
+    this.data = cloneContext(data, "context");
     this.lineage = [{ at: nowIso(), event: "born", from: seed, toVersion: 0 }];
     this.view = new ContextView(this);
   }
   advance(nextData, event, from) {
     const fromVersion = this.version;
-    this.data = cloneContext(nextData);
+    this.data = cloneContext(nextData, "context");
     this.version += 1;
     this.lineage.push({ at: nowIso(), event, from, fromVersion, toVersion: this.version });
     return fromVersion;
@@ -220,6 +310,19 @@ class ContextView {
   }
   snapshot() {
     return snapshot(this.#head.data); // frozen deep clone — the belief, as data
+  }
+  /** THE detached ContextVersion (S2.2a, spec §1): not a live cursor.
+   *  Read v3 and it stays v3 forever, even after the head has advanced
+   *  to v5 — deep-frozen data plus its own lineage snapshot, with no
+   *  reference path back to the head. A context obligation must bind
+   *  THIS value, never a cursor that quietly changes under it. */
+  current() {
+    const head = this.#head;
+    return Object.freeze({
+      version: head.version,
+      snapshot: snapshot(head.data),
+      lineageRef: Object.freeze(head.lineage.map((l) => Object.freeze({ ...l }))),
+    });
   }
 }
 
@@ -304,10 +407,10 @@ export class Intent {
       agent, // AgentPrincipal currently holding the envelope
       parent,
       children: new Set(), // child intent ids — the revoke cascade walks this
-      goal: cloneContext(goal), // the requested outcome, plain data
-      budget: budget === null ? null : cloneContext(budget), // {calls} charged per mediated attempt
+      goal: cloneContext(goal, "goal"), // the requested outcome, plain data
+      budget: budget === null ? null : cloneContext(budget, "budget"), // {calls} charged per mediated attempt
       deadline, // absolute ms, enforced by the substrate at request time
-      approval: typeof approval === "string" ? approval : cloneContext(approval), // "not_required" | "required" | { approved, at }
+      approval: typeof approval === "string" ? approval : cloneContext(approval, "approval"), // "not_required" | "required" | { approved, at }
       context: new ContextHead(contextSeed, id),
       openedAt: nowIso(),
       // state null / version -1 until the OPEN genesis edge lands them at
@@ -597,7 +700,7 @@ export class AgentSystem {
     if (rec.approval !== "required") {
       throw new SubstrateError("E_STATE", "this intent never required approval");
     }
-    rec.approval = { approved: cloneContext(scope), at: nowIso() };
+    rec.approval = { approved: cloneContext(scope, "approval scope"), at: nowIso() };
     this.#fact({ t: "intent_approve", intent: rec.id, scope: rec.approval.approved });
   }
 
@@ -734,12 +837,13 @@ export class AgentSystem {
    *  and every obligation needs ≥ minOccurrences distinct discharges.
    *  With an empty contract the S1 gate remains: at least one ledger-
    *  backed ok effect — the degenerate one-obligation case.
-   *  KNOWN GAP (lands with the COMPLETING skeleton, spec §8 item 2): a
-   *  FAILED completion on the legacy path may still leave candidate
-   *  evidence in the record; the working-set commit rule ("claims form a
-   *  temporary set; evidence truth changes only at COMPLETING → COMPLETED")
-   *  is deliberately not patched here. The contract branch already
-   *  follows it. */
+   *  Both branches now follow the working-set commit rule (§8 item 2
+   *  applied early, S2.2a): claims are validated and domain-owned into a
+   *  temporary set first; evidence truth changes only when the whole set
+   *  clears, so a refused completion leaves state AND ledger
+   *  structurally valid. The full COMPLETING state (an explicit
+   *  COMPLETING check-state, approval/closure/context obligation kinds,
+   *  matcher semantics) still lands with spec §8 item 2's main slice. */
   async complete(intent, claims = []) {
     const rec = this.#R(intent);
     this.#guardLive(rec);
@@ -748,16 +852,21 @@ export class AgentSystem {
       throw new SubstrateError("E_NO_EVIDENCE", "completion requires at least one evidence item");
     }
     const backed = this.#journalBackedXacts(rec.id);
-    for (const item of claims) {
+    // Working-set commit rule (§8 item 2, applied early to this path):
+    // every claim is validated and owned BEFORE the evidence set moves,
+    // so a refused completion leaves state AND ledger structurally
+    // valid — not even a candidate item survives the throw.
+    const prepared = claims.map((item) => {
       const isBacked = !!(item && item.xact && backed.has(item.xact));
       if (item && item.xact && !isBacked) {
         throw new SubstrateError("E_NO_EVIDENCE", `evidence xact '${item.xact}' is not a journaled ok call on this intent`);
       }
-      rec.evidence.push({ ...cloneOrWrap(item), backed: isBacked });
-    }
-    if (!rec.evidence.some((e) => e.backed)) {
+      return { ...cloneContext(item ?? {}, "evidence item"), backed: isBacked };
+    });
+    if (!prepared.some((e) => e.backed)) {
       throw new SubstrateError("E_NO_EVIDENCE", "no evidence item is backed by the ledger");
     }
+    rec.evidence.push(...prepared);
     this.#transition(intent, "completed", "complete");
     this.#fact({ t: "intent_complete", intent: rec.id, agent: AGENT_PRIV.get(rec.agent).id, evidence: rec.evidence.length });
     return intent;
@@ -795,7 +904,7 @@ export class AgentSystem {
       this.#fact({ t: "completion_denied", intent: rec.id, unmet });
       throw new SubstrateError("E_NO_EVIDENCE", `unmet obligations: ${unmet.join(", ")}`);
     }
-    rec.evidence.push(...claims.map((c) => ({ ...cloneOrWrap(c), backed: true })));
+    rec.evidence.push(...claims.map((c) => ({ ...cloneContext(c ?? {}, "claim"), backed: true })));
     this.#transition(intent, "completed", "complete");
     this.#fact({
       t: "intent_complete", intent: rec.id, agent: AGENT_PRIV.get(rec.agent).id,
@@ -811,7 +920,11 @@ export class AgentSystem {
     const rec = this.#R(intent);
     this.#guardLive(rec);
     this.#transition(intent, "failed", "fail");
-    this.#fact({ t: "intent_fail", intent: rec.id, agent: AGENT_PRIV.get(rec.agent).id, reason: String(reason ?? "") });
+    // S2.2a: the reason goes in RAW — #fact sanitizes it structurally.
+    // String(reason) was an attacker-controlled conversion on the fact
+    // path: a throwing toString used to abort the call AFTER the
+    // transition, leaving FAILED truth with no intent_fail fact.
+    this.#fact({ t: "intent_fail", intent: rec.id, agent: AGENT_PRIV.get(rec.agent).id, reason: reason ?? null });
   }
 
   /** Revoke: the whole subtree dies; every envelope capability is revoked
@@ -870,12 +983,16 @@ export class AgentSystem {
   }
 
   #fact(ev) {
-    // S2.1c: the ledger boundary. Provenance.append does NOT clone, and
-    // the event's content is hashed as it stands — so a caller-owned (or
+    // S2.1c: the ledger boundary. Provenance does NOT clone, and the
+    // event's content is hashed as it stands — so a caller-owned (or
     // record-owned) reference passed straight through would leave a live
-    // alias inside already-hashed history. Own every value on the way in.
+    // alias inside already-hashed history. S2.2a: ownership is paired
+    // with the domain — every value is rebuilt structurally, attacker
+    // conversions (String/getters) are never executed, and out-of-domain
+    // leaves become fixed {$notInDomain} markers so a denial fact can
+    // never fail to land.
     const owned = {};
-    for (const k of Object.keys(ev)) owned[k] = ownValue(ev[k]);
+    for (const k of Object.keys(ev)) owned[k] = factValue(ev[k]);
     this.rt.record({ ...owned, at: nowIso() });
   }
 
@@ -933,13 +1050,5 @@ export class AgentSystem {
     if (!states.includes(rec.state)) {
       throw new SubstrateError("E_STATE", `intent is ${rec.state}, expected ${states.join("|")}`);
     }
-  }
-}
-
-function cloneOrWrap(item) {
-  try {
-    return structuredClone(item);
-  } catch {
-    return { note: String(item) };
   }
 }

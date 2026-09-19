@@ -58,7 +58,7 @@ provable against each other. The negative gate is the milestone:
 `complete()` refuses without at least one evidence item backed by a
 journaled `ok` invocation. Acceptance: 13 lifecycle + negative tests.
 
-## S2 — APM as normative spec (rev. S2.0.7, `spec/apm.md`)
+## S2 — APM as normative spec (rev. S2.0.8, `spec/apm.md`)
 
 The spec stands on its own, independent of the JavaScript prototype. It
 is built on three separations — **Ownership is not authority. Evidence
@@ -307,6 +307,39 @@ Maps already hash identically — exotic values break hash-content
 binding TODAY), then immutable ContextVersion values, then the four
 obligation kinds. **Trusted-state closure is declared finished; next
 slice, unconditionally: COMPLETING.**
+
+**S2.2a progress** (2026-09-20, COMPLETING floor — steps 1–2 of the
+nailed order, round-11 directive): round 11 SIGNED `7073c21`
+("APPROVE ST-2 + ST-3 trusted-state closure — 直接进入 COMPLETING，不再
+开 S2.1e") and froze the first two steps as prerequisites. Landed:
+(1) the JSON-SAFE PLAIN-DATA DOMAIN as ST-3's value language, defined
+against provenance's JSON-shaped hashing rather than against
+structuredClone (cloneable ≠ representable: Maps clone and hash as
+`{}`, BigInts clone and throw inside `record()`): ingress refuses
+out-of-domain values with E_DOMAIN before any write — refused opens
+journal no genesis fact at all — and the fact path SANITIZES: every
+value is rebuilt from own data descriptors, unrepresentable leaves
+become fixed `{$notInDomain, tag}` markers. With this the round-11
+MAJOR died: `ownValue`'s `String(v)` fallback executed attacker code
+(a hostile `toString`/`Symbol.toPrimitive` could throw and erase the
+denial fact of its own refusal; a throwing getter ran during cloning)
+— conversions are no longer ever the value's job. Authoritative ingress
+clones switched from `structuredClone` to a same-realm structural
+copier, which the domain makes provably faithful and which keeps
+records free of realm-mismatched artifacts. (2) CONTEXT AS DETACHED
+VALUES: `context.current()` returns a frozen
+`{version, snapshot, lineageRef}` — read v3 and it stays v3 while the
+head walks to v5 — so the future `context` obligation binds a value,
+not a cursor. Early applications of §8 item 2's working-set commit
+rule also landed on both completion paths (claims validate and
+domain-own before any evidence write). Four oracles, 48/48 APM +
+51/51 invariant; against pre-fix `7073c21` exactly the four new tests
+fail (Map goals accepted, the hostile claim throws "boom" with no
+denial fact, reasons degrade to `"[object Object]"`, `current()`
+doesn't exist) and all 44 older pass unchanged. `runtime.js`
+untouched; no new DEP; ST-4 not claimed. Next slice: the COMPLETING
+machinery proper — ST-1 entry-as-check, four obligation kinds, matcher
+semantics — then DC-5 negative-gate-first.
 
 # Track E — enforcement
 
