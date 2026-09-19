@@ -391,6 +391,11 @@ export class Runtime {
     } catch {
       deny("E_INVAL", "bad membrane factory");
     }
+    // occupancy is checked BEFORE minting: a denied overwrite must not
+    // leave a ghost child linked into the revocation tree.
+    if (!overwrite && toSt.slots.has(toSlot)) {
+      deny("E_OCCUPIED", `slot '${toSlot}' on actor ${toSt.token.id} is occupied`);
+    }
     const child = this.#mint({
       kind: src.kind,
       target: src.target,
@@ -400,9 +405,6 @@ export class Runtime {
       instances: [...src.instances, ...created],
     });
     src.children.push(child);
-    if (!overwrite && toSt.slots.has(toSlot)) {
-      deny("E_OCCUPIED", `slot '${toSlot}' on actor ${toSt.token.id} is occupied`);
-    }
     toSt.slots.set(toSlot, child);
     this.#journal.append({
       t: "grant", xact: gx, to: toSt.token.id, tool: src.name, slot: toSlot, rights: next,
