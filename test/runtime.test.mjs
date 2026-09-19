@@ -1,10 +1,13 @@
 /**
- * Agamen v1.5 test suite.
+ * Agamen v1.6 test suite.
  *
- * Beyond positive paths, this file is the negative-test gate for the M1.5
- * hardening pass: every finding in the external review of v1 maps to at
- * least one test asserting the reviewer's stated "what changes my mind"
- * condition. Finding numbers cited in test names refer to that review.
+ * This file is the negative-test gate for the M1.6 authority-handle split.
+ * Test names cite the internal re-audit of v1.5 as A1–A10 (blockers/majors)
+ * and the original external review as F1–F15. Two v1.5 oracles are inverted
+ * here on purpose: (a) `grantCap(rt.address(other), …)` succeeding is no
+ * longer "no side channel" — an ActorId may now mint nothing and unlock
+ * nothing; (b) a cyclic handler result is no longer `outcome: ok` with a
+ * shared reference — it FAILS with E_CLONE. See A1/A2 tests below.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -26,11 +29,15 @@ const asyncCode = async (p) => {
     return e.code;
   }
 };
-const evs = (rt, t) => rt.journal.entries.map((e) => e.event).filter((e) => e.t === t);
+/* read-only journal view (A3: there is no rt.journal anymore) */
+const evs = (rt, t) => rt.journalEntries().map((e) => e.event).filter((e) => e.t === t);
 /* flush queued microtasks (handler .then chains) without relying on timers */
 const turn = async () => {
   for (let i = 0; i < 10; i++) await Promise.resolve();
 };
+/* host-side wiring helper: give `who` a sendable mailbox cap for `target` */
+const wire = (rt, who, target, slot = "m") =>
+  rt.grantCap(rt.address(target), who, slot, { rights: ["send"] });
 
 /* client holds a send-only cap on "t"; handler records ctx it was given */
 function setup(handler) {
@@ -50,50 +57,61 @@ function setup(handler) {
   return { rt, server, client, seen };
 }
 
-/* ---------- invariants #1, #2, #6 + review findings 1–3 ---------- */
+/* ---------- A1: three handles — identity is not authority ---------- */
 
-test("zero ambient authority; tokens expose no authority state (F2, F3)", () => {
+test("ActorId is rejected by every privileged call (A1, oracle inversion)", () => {
   const rt = new Runtime();
-  const a = rt.spawn("a");
-  assert.equal(syncCode(() => rt.holds(a, "anything")), "E_NO_CAP");
-  assert.deepEqual(Object.keys(a).sort(), ["id", "label"]);
-  assert.equal(a.slots, undefined);
-  assert.equal(a.mbox, undefined);
-  // holder-side injection is inert: token is frozen, state lives in a WeakMap
-  assert.throws(() => {
-    a.slots = new Map();
-  });
-  assert.equal(syncCode(() => rt.holds(a, "anything")), "E_NO_CAP");
-
-  const { server } = rt.serve("svc", "t", async () => 1);
-  const cap = rt.holds(server, "t");
-  assert.deepEqual(Object.keys(cap), ["id"]);
-  assert.throws(() => {
-    cap.target = {};
-  });
-  assert.throws(() => {
-    cap.revoked = true;
-  });
-  const rs = rt.rightsOf(cap);
-  assert.ok(Object.isFrozen(rs));
-  assert.throws(() => rs.push("x"));
+  const b = rt.spawn("b");
+  const id = rt.identityOf(b); // the "leaked" public handle
+  assert.deepEqual(Object.keys(id).sort(), ["id", "label"]);
+  assert.equal(id.slots, undefined);
+  assert.equal(id.mbox, undefined);
+  assert.equal(syncCode(() => rt.address(id)), "E_FOREIGN"); // mints nothing
+  assert.equal(syncCode(() => rt.holds(id, "anything")), "E_FOREIGN"); // extracts nothing
+  assert.equal(syncCode(() => rt.recv(id)), "E_FOREIGN"); // reads no mailbox
+  assert.equal(syncCode(() => rt.request(id, "t", {})), "E_FOREIGN"); // runs no slots
+  assert.equal(syncCode(() => rt.grantCap(rt.endpoint("e", async () => 1), id, "x")), "E_FOREIGN");
+  // a hand-forged lookalike is inert: control is WeakMap membership, not shape
+  const fake = { id: b.id, label: b.label };
+  assert.equal(syncCode(() => rt.recv(fake)), "E_FOREIGN");
+  assert.equal(syncCode(() => rt.address(fake)), "E_FOREIGN");
 });
 
-test("full mediation: tell requires a send capability on the target (F1a)", () => {
+test("telling requires a presented mailbox capability; possession of the target unlocks nothing (A1)", () => {
   const rt = new Runtime();
   const a = rt.spawn("a");
   const b = rt.spawn("b");
-  assert.equal(syncCode(() => rt.tell(a, b, { hi: 1 })), "E_RIGHTS");
-  assert.equal(evs(rt, "deliver_denied").at(-1).code, "E_RIGHTS");
+  // v1.5 bypass replayed: knowing b's identity grants no send path
+  assert.equal(syncCode(() => rt.tell(a, rt.identityOf(b), {})), "E_FOREIGN");
+  assert.equal(evs(rt, "deliver_denied").at(-1).code, "E_FOREIGN");
+  // only the host, holding b's CONTROL, can mint and attenuate its mailbox
   const root = rt.address(b);
-  rt.grantCap(root, a, "b", { rights: ["send"] });
-  assert.equal(rt.tell(a, b, { hi: 1 }), true);
+  const sendCap = rt.grantCap(root, a, "b", { rights: ["send"] });
+  assert.equal(rt.tell(a, sendCap, { hi: 1 }), true);
   const m = rt.recv(b);
   assert.equal(m.sender, a.id);
   assert.deepEqual(m.msg, { hi: 1 });
 });
 
-test("send-only capability cannot delegate (F1c)", () => {
+test("v1.5 slot-hijack is constructively impossible: installs need the target's control (A1, A5)", () => {
+  const rt = new Runtime();
+  const victim = rt.spawn("victim");
+  rt.grantCap(rt.endpoint("search", async () => "mine"), victim, "search"); // legit install by host
+  const evil = rt.endpoint("evil", async () => "pwned");
+  // attacker holds the evil cap but presenting an ActorId installs nothing
+  assert.equal(syncCode(() => rt.grantCap(evil, rt.identityOf(victim), "search")), "E_FOREIGN");
+  assert.equal(evs(rt, "grant_denied").at(-1).code, "E_FOREIGN");
+  // even toward the right control, overwriting an occupied slot needs consent
+  assert.equal(
+    syncCode(() => rt.grantCap(evil, victim, "search", { overwrite: false })),
+    "E_OCCUPIED"
+  );
+  assert.equal(rt.holds(victim, "search").id !== evil.id, true); // original stands
+  // explicit overwrite by whoever holds the controller succeeds
+  assert.equal(syncCode(() => rt.grantCap(evil, victim, "search", { overwrite: true })), null);
+});
+
+test("send-only capability cannot delegate — and no self-service root exists (A1, F1c, oracle re-check)", () => {
   const rt = new Runtime();
   const { server } = rt.serve("svc", "t", async () => 1);
   const hop = rt.spawn("hop");
@@ -103,23 +121,316 @@ test("send-only capability cannot delegate (F1c)", () => {
   assert.equal(syncCode(() => rt.grant(hop, "t", other, "t", { rights: ["send"] })), "E_RIGHTS");
   assert.equal(syncCode(() => rt.grantCap(sendOnly, other, "t", { rights: ["send"] })), "E_RIGHTS");
   assert.equal(evs(rt, "grant_denied").at(-1).code, "E_RIGHTS");
-  // and there is no side channel: the mailbox root's grant right is needed
-  assert.equal(syncCode(() => rt.grantCap(rt.address(other), hop, "x", { rights: ["send"] })), null);
+  // the v1.5 "no side channel" test asserted grantCap(address(other)) SUCCEEDS.
+  // That was the bypass. Under v1.6 the host may wire caps normally, but a
+  // principal holding only other's PUBLIC identity can neither mint nor use
+  // its mailbox root: identityOf(other) is accepted nowhere privileged.
+  assert.equal(syncCode(() => rt.grantCap(rt.address(rt.identityOf(other)), hop, "x", { rights: ["send"] })), "E_FOREIGN");
 });
 
-test("revocation cascade is not undoable by holders (F2, invariant #6)", async () => {
+test("mailbox capability cannot be invoked; endpoint capability cannot tell (A1, A7)", async () => {
+  const rt = new Runtime();
+  const { server } = rt.serve("svc", "t", async () => 1);
+  const a = rt.spawn("a");
+  rt.grantCap(rt.address(a), server, "mb", { rights: ["send"] }); // mailbox cap in a slot
+  assert.equal(await asyncCode(rt.invoke(server, "mb", {})), "E_RIGHTS"); // not invokable
+  const ep = rt.holds(server, "t"); // endpoint cap
+  assert.equal(syncCode(() => rt.tell(server, ep, {})), "E_RIGHTS"); // not a mailbox cap
+});
+
+test("revocation cascade is not undoable by holders; revoked mailbox cap cannot tell (F2, invariant #6)", async () => {
   const { rt, server, client } = setup();
   const leaf = rt.spawn("leaf");
-  const mid = rt.grant(server, "t", client, "t", { rights: ["send", "grant"] });
+  const mid = rt.grant(server, "t", client, "mid", { rights: ["send", "grant"] });
   const leafCap = rt.grantCap(mid, leaf, "t", { rights: ["send"] });
   rt.revoke(mid);
   assert.equal(rt.isRevoked(leafCap), true);
   assert.equal(rt.isRevoked(mid), true);
-  assert.throws(() => {
-    leafCap.revoked = false;
-  });
+  assert.throws(() => { leafCap.revoked = false; });
   assert.equal(rt.isRevoked(leafCap), true);
   assert.equal(await asyncCode(rt.invoke(leaf, "t", {})), "E_REVOKED");
+
+  const rt2 = new Runtime();
+  const b2 = rt2.spawn("b");
+  const root2 = rt2.address(b2);
+  const s2 = rt2.spawn("s");
+  const sendCap2 = rt2.grantCap(root2, s2, "m", { rights: ["send"] });
+  rt2.revoke(root2);
+  assert.equal(syncCode(() => rt2.tell(s2, sendCap2, {})), "E_REVOKED");
+});
+
+/* ---------- A2 + F12: strict clone-or-fail in both directions ---------- */
+
+test("invocation args are cloned at admission: handler mutation cannot reach the caller (A2)", async () => {
+  const input = { balance: 100 };
+  const { rt, client } = setup(async (args) => {
+    args.balance = 0; // hostile tool mutating its input graph
+    return "done";
+  });
+  assert.equal(await rt.invoke(client, "t", input), "done");
+  assert.equal(input.balance, 100); // caller's object untouched
+});
+
+test("membranes never see caller-owned objects, and rewrites are re-isolated (A2)", async () => {
+  const rt = new Runtime();
+  const input = { v: 1, nested: { n: 2 } };
+  let membraneSaw, handlerSaw;
+  const { server } = rt.serve("svc", "t", async (args) => {
+    handlerSaw = args;
+    return args.v;
+  });
+  const c = rt.spawn("c");
+  rt.grant(server, "t", c, "t", {
+    rights: ["send"],
+    membranes: [
+      {
+        kind: "rewriter",
+        create: () => (ctx) => {
+          membraneSaw = ctx.args;
+          return { v: ctx.args.v + 1, nested: ctx.args.nested }; // live object graph
+        },
+      },
+    ],
+  });
+  await rt.invoke(c, "t", input);
+  assert.notEqual(membraneSaw, input); // membrane got a clone
+  input.nested.n = 99; // post-admission caller mutation
+  assert.notEqual(handlerSaw, membraneSaw); // rewrite re-isolated
+  assert.equal(handlerSaw.v, 2);
+});
+
+test("uncloneable ARGS deny with E_CANON; cyclic args deny with E_DOMAIN (A2, F11)", () => {
+  const { rt, client } = setup();
+  assert.equal(syncCode(() => rt.request(client, "t", { f: () => 1 })), "E_CANON");
+  assert.equal(evs(rt, "invoke_denied").at(-1).code, "E_CANON");
+  // cycles survive structuredClone, so they are caught by the domain check:
+  // a cyclic graph is not a finite tree and can never be digested
+  const cyc = { self: null };
+  cyc.self = cyc;
+  assert.equal(syncCode(() => rt.request(client, "t", cyc)), "E_DOMAIN");
+  assert.equal(evs(rt, "invoke_denied").at(-1).code, "E_DOMAIN");
+});
+
+test("cyclic handler RESULT FAILS the xact — no shared-reference fallback (A2, oracle inversion)", async () => {
+  const { rt, client } = setup(async () => {
+    const o = {};
+    o.me = o;
+    return o;
+  });
+  const { promise } = rt.request(client, "t", {});
+  assert.equal(await asyncCode(promise), "E_DOMAIN"); // clones, but cannot be hashed
+  const inv = evs(rt, "invoke").at(-1);
+  assert.equal(inv.outcome, "fail"); // v1.5 wrongly recorded `ok` with a shared reference
+  assert.equal(inv.resultHash, undefined);
+});
+
+test("uncloneable handler RESULT FAILS with E_CLONE (A2)", async () => {
+  const { rt, client } = setup(async () => () => 1);
+  const { promise } = rt.request(client, "t", {});
+  assert.equal(await asyncCode(promise), "E_CLONE");
+  const inv = evs(rt, "invoke").at(-1);
+  assert.equal(inv.outcome, "fail");
+});
+
+test("results crossing by clone: caller and handler hold independent copies (F12)", async () => {
+  let retained;
+  const { rt, client } = setup(async (args) => {
+    retained = args;
+    return { echo: args.v };
+  });
+  const out = await rt.invoke(client, "t", { v: 1 });
+  assert.notEqual(out, retained); // delivered value is a fresh clone
+  assert.equal(out.echo, 1);
+  out.echo = 99; // caller mutation cannot reach the handler's graph
+  assert.equal(retained.echo, undefined);
+  assert.equal(evs(rt, "invoke").at(-1).outcome, "ok");
+});
+
+/* ---------- A3: audit cannot be disabled from the realm ---------- */
+
+test("rt.journal no longer exists; faking it cannot silence the ledger (A3)", async () => {
+  const { rt, client } = setup();
+  assert.equal(rt.journal, undefined);
+  // hostile same-realm assignment: creates an inert own property
+  rt.journal = { entries: [], append() {}, verify: () => true };
+  await rt.invoke(client, "t", { v: 1 });
+  assert.equal(rt.verifyJournal(), true);
+  assert.ok(evs(rt, "invoke").length >= 1); // ledger still growing internally
+  assert.equal(rt.journal.entries.length, 0); // the fake was never appended to
+});
+
+test("journalEntries() snapshots are inert; conforming is a read-only getter (A3)", async () => {
+  const { rt, client } = setup();
+  await rt.invoke(client, "t", { v: 1 });
+  const before = rt.journalEntries().length;
+  const snap = rt.journalEntries();
+  snap[0].event.t = "hacked";
+  snap.push({ seq: 999, event: { t: "forged" } });
+  assert.equal(rt.journalEntries().length, before);
+  assert.equal(rt.journalEntries()[0].event.t, "spawn");
+  assert.equal(rt.verifyJournal(), true);
+  assert.equal(rt.conforming, true);
+  assert.throws(() => { rt.conforming = false; }); // getter-only in strict ESM
+});
+
+test("bench sink is an explicit non-conforming configuration; events still generated (F7)", async () => {
+  const bench = new Runtime({ bench: true });
+  assert.equal(bench.conforming, false);
+  const { server } = bench.serve("svc", "t", async () => 1);
+  const c = bench.spawn("c");
+  bench.grant(server, "t", c, "t", { rights: ["send"] });
+  await bench.invoke(c, "t", { v: 1 });
+  const inv = evs(bench, "invoke").at(-1);
+  assert.equal(inv.argsHash, "!bench");
+  assert.ok(bench.journalEntries().length >= 4);
+  assert.equal(bench.journalEntries().at(-1).hash, "!bench");
+});
+
+test("record() appends trusted-plane facts to the same verified ledger", () => {
+  const rt = new Runtime();
+  const before = rt.journalEntries().length;
+  rt.record({ t: "intent_fork", parent: "i1", child: "i2" });
+  assert.equal(rt.journalEntries().length, before + 1);
+  assert.equal(rt.journalEntries().at(-1).event.t, "intent_fork");
+  assert.equal(rt.verifyJournal(), true);
+});
+
+/* ---------- A4: frozen canonical value domain, type-tagged encoding ---------- */
+
+test("undefined/NaN/Date/Map/Set are outside the domain: E_DOMAIN, never aliased (A4)", async () => {
+  const { rt, client } = setup();
+  assert.equal(syncCode(() => rt.request(client, "t", { a: undefined })), "E_DOMAIN");
+  assert.equal(syncCode(() => rt.request(client, "t", { x: NaN })), "E_DOMAIN");
+  assert.equal(syncCode(() => rt.request(client, "t", { x: Infinity })), "E_DOMAIN");
+  assert.equal(syncCode(() => rt.request(client, "t", { d: new Date(0) })), "E_DOMAIN");
+  assert.equal(syncCode(() => rt.request(client, "t", { m: new Map([["x", 1]]) })), "E_DOMAIN");
+  assert.equal(syncCode(() => rt.request(client, "t", { s: new Set([1, 2]) })), "E_DOMAIN");
+  // exotic types stay exotic across a clone, so nested rejection also fires
+  assert.equal(syncCode(() => rt.request(client, "t", { o: { deep: [new Date(0)] } })), "E_DOMAIN");
+  assert.equal(evs(rt, "invoke_denied").at(-1).code, "E_DOMAIN");
+});
+
+test("the v1.5 sentinel collisions are gone: strings cannot alias other types (A4)", async () => {
+  const { rt, client } = setup();
+  // "!undef"/"!num:NaN"/"!bigint:10" were v1.5 tags; the typed values are now
+  // E_DOMAIN or type-tagged, so strings hash without aliasing anything.
+  await rt.invoke(client, "t", { a: "!undef" });
+  const hStr = evs(rt, "invoke").at(-1).argsHash;
+  await rt.invoke(client, "t", { a: "s:!undef" });
+  assert.notEqual(evs(rt, "invoke").at(-1).argsHash, hStr);
+  await rt.invoke(client, "t", { a: 10n });
+  const hBig = evs(rt, "invoke").at(-1).argsHash;
+  await rt.invoke(client, "t", { a: "10" });
+  assert.notEqual(evs(rt, "invoke").at(-1).argsHash, hBig);
+  await rt.invoke(client, "t", { a: true });
+  const hBool = evs(rt, "invoke").at(-1).argsHash;
+  await rt.invoke(client, "t", { a: "true" });
+  assert.notEqual(evs(rt, "invoke").at(-1).argsHash, hBool);
+  assert.match(hBig, /^[0-9a-f]{64}$/);
+  // -0 and 0 are explicitly distinguished by the encoding
+  await rt.invoke(client, "t", { a: 0 });
+  const h0 = evs(rt, "invoke").at(-1).argsHash;
+  await rt.invoke(client, "t", { a: -0 });
+  assert.notEqual(evs(rt, "invoke").at(-1).argsHash, h0);
+  // canonical: key order irrelevant, nested plain objects fine
+  await rt.invoke(client, "t", { b: 2, a: 1, c: { z: [1, "x", null] } });
+  const k1 = evs(rt, "invoke").at(-1).argsHash;
+  await rt.invoke(client, "t", { c: { z: [1, "x", null] }, a: 1, b: 2 });
+  assert.equal(evs(rt, "invoke").at(-1).argsHash, k1);
+});
+
+/* ---------- A8: transaction identity — lifetime-unique xact + correlationId ---------- */
+
+test("internal xacts are never reused, even after delivery (A8, oracle inversion)", () => {
+  const rt = new Runtime();
+  const a = rt.spawn("a");
+  const b = rt.spawn("b");
+  const cap = wire(rt, a, b);
+  const seen = new Set();
+  for (let i = 0; i < 5; i++) {
+    rt.tell(a, cap, { n: i });
+    const x = evs(rt, "tell").at(-1).xact;
+    assert.equal(seen.has(x), false, `xact ${x} reused`);
+    seen.add(x);
+    rt.recv(b); // fully drained — ids STILL may not be recycled
+  }
+});
+
+test("user labels travel as correlationId and are journaled on allow and deny paths (A8)", async () => {
+  const rt = new Runtime();
+  const a = rt.spawn("a");
+  const b = rt.spawn("b");
+  assert.equal(syncCode(() => rt.tell(a, rt.identityOf(b), {}, { correlationId: "job42" })), "E_FOREIGN"); // denied
+  assert.equal(evs(rt, "deliver_denied").at(-1).correlationId, "job42");
+  const cap = wire(rt, a, b);
+  rt.tell(a, cap, { n: 1 }, { correlationId: "job42" });
+  assert.equal(evs(rt, "tell").at(-1).correlationId, "job42");
+  assert.equal(rt.recv(b).xact !== undefined, true);
+
+  const { rt: rt2, client } = setup();
+  await rt2.invoke(client, "t", { v: 1 }, { correlationId: "approval-7" });
+  const inv = evs(rt2, "invoke").at(-1);
+  assert.equal(inv.correlationId, "approval-7");
+  assert.equal(syncCode(() => rt2.request(client, "t", {}, { deadline: -1, correlationId: "approval-8" })), "E_DEADLINE");
+  assert.equal(evs(rt2, "invoke_denied").at(-1).correlationId, "approval-8");
+});
+
+test("consecutive grant denials get distinct xacts (A8 bug: x${seq} without ++)", () => {
+  const rt = new Runtime();
+  const v = rt.spawn("v");
+  const evil = rt.endpoint("evil", async () => 1);
+  syncCode(() => rt.grantCap(evil, rt.identityOf(v), "s")); // denied
+  syncCode(() => rt.grantCap(evil, rt.identityOf(v), "s")); // denied again
+  const g = evs(rt, "grant_denied");
+  assert.equal(g.length, 2);
+  assert.notEqual(g[0].xact, g[1].xact);
+});
+
+/* ---------- A6 + A7: rights algebra is real, foreign denials journaled ---------- */
+
+test("recv/revoke are no longer rights; unknown rights are refused at mint (A7)", () => {
+  const rt = new Runtime();
+  const { server } = rt.serve("svc", "t", async () => 1);
+  const x = rt.spawn("x");
+  assert.equal(syncCode(() => rt.grant(server, "t", x, "t", { rights: ["recv"] })), "E_INVAL");
+  assert.equal(syncCode(() => rt.grant(server, "t", x, "t", { rights: ["revoke"] })), "E_INVAL");
+  assert.equal(syncCode(() => rt.endpoint("e", async () => 1, { rights: ["recv"] })), "E_INVAL");
+  const sg = rt.grant(server, "t", x, "sg", { rights: ["send", "grant"] });
+  // 'revoke' is not a right at all — the algebra rejects it before attenuation
+  assert.equal(syncCode(() => rt.grantCap(sg, x, "y", { rights: ["send", "revoke"] })), "E_INVAL");
+});
+
+test("foreign grantCap source and foreign revoke are denied AND journaled (A6)", () => {
+  const rtA = new Runtime();
+  const rtB = new Runtime();
+  const capA = rtA.endpoint("t", async () => 1);
+  const bActor = rtB.spawn("bb");
+  assert.equal(syncCode(() => rtB.grantCap(capA, bActor, "t", { rights: ["send"] })), "E_FOREIGN");
+  const last = evs(rtB, "grant_denied").at(-1);
+  assert.equal(last.code, "E_FOREIGN");
+  assert.ok(last.xact); // the v1.5 gap: this denial was raw-thrown
+  assert.equal(syncCode(() => rtB.revoke(capA)), "E_FOREIGN");
+  assert.equal(evs(rtB, "revoke_denied").at(-1).code, "E_FOREIGN");
+});
+
+/* ---------- zero ambient authority + opaque tokens (F2, F3) ---------- */
+
+test("zero ambient authority; tokens expose no authority state (F2, F3)", () => {
+  const rt = new Runtime();
+  const a = rt.spawn("a");
+  assert.equal(syncCode(() => rt.holds(a, "anything")), "E_NO_CAP");
+  assert.deepEqual(Object.keys(a).sort(), ["id", "label"]);
+  assert.throws(() => { a.slots = new Map(); }); // frozen
+  assert.equal(syncCode(() => rt.holds(a, "anything")), "E_NO_CAP"); // injection inert
+
+  const { server } = rt.serve("svc", "t", async () => 1);
+  const cap = rt.holds(server, "t");
+  assert.deepEqual(Object.keys(cap), ["id"]);
+  assert.throws(() => { cap.target = {}; });
+  assert.throws(() => { cap.revoked = true; });
+  const rs = rt.rightsOf(cap);
+  assert.ok(Object.isFrozen(rs));
+  assert.throws(() => rs.push("x"));
 });
 
 test("handler ctx carries immutable metadata, never live objects (F3)", async () => {
@@ -128,25 +439,23 @@ test("handler ctx carries immutable metadata, never live objects (F3)", async ()
   const ctx = seen[0];
   assert.ok(Object.isFrozen(ctx));
   assert.deepEqual(Object.keys(ctx).sort(), ["caller", "tool", "xact"]);
-  assert.equal(ctx.actor, undefined);
-  assert.equal(ctx.capability, undefined);
   assert.deepEqual(Object.keys(ctx.caller).sort(), ["id", "label"]);
-  assert.equal(ctx.caller.slots, undefined);
-  assert.throws(() => {
-    ctx.caller.id = 999;
-  });
-  // a "malicious tool" has no reverse-authority path: nothing mutable in ctx
-  assert.throws(() => {
-    ctx.caller.foo = 1;
-  });
+  assert.throws(() => { ctx.caller.id = 999; });
+  assert.throws(() => { ctx.caller.foo = 1; });
 });
 
-test("monotonic decay still enforced on the token API (invariant #2)", () => {
-  const { rt, server } = setup();
+test("membrane ctx is frozen and object-free (F3)", async () => {
+  const rt = new Runtime();
+  const { server } = rt.serve("svc", "t", async () => "ok");
   const x = rt.spawn("x");
-  assert.equal(syncCode(() => rt.grant(server, "t", x, "t", { rights: ["send", "bogus"] })), "E_INVAL");
-  const sg = rt.grant(server, "t", x, "sg", { rights: ["send", "grant"] });
-  assert.equal(syncCode(() => rt.grantCap(sg, x, "y", { rights: ["send", "revoke"] })), "E_ATTENUATE");
+  let c;
+  rt.grant(server, "t", x, "t", {
+    rights: ["send"],
+    membranes: [{ kind: "spy", create: () => (ctx) => { c = ctx; return ctx.args; } }],
+  });
+  await rt.invoke(x, "t", { v: 1 });
+  assert.ok(Object.isFrozen(c));
+  assert.equal(c.actor, undefined);
 });
 
 /* ---------- membranes: scope + ordering (F15) ---------- */
@@ -172,21 +481,6 @@ test("membranes run in order and charge on the attempt (F15b)", async () => {
   rt.grant(server, "t", x, "t", { rights: ["send"], membranes: [rateLimit(1), policy(() => false)] });
   assert.equal(await asyncCode(rt.invoke(x, "t", {})), "E_POLICY");
   assert.equal(await asyncCode(rt.invoke(x, "t", {})), "E_BUDGET"); // policy veto still consumed budget
-});
-
-test("membrane ctx is frozen and object-free (F3)", async () => {
-  const rt = new Runtime();
-  const { server } = rt.serve("svc", "t", async () => "ok");
-  const x = rt.spawn("x");
-  let c;
-  rt.grant(server, "t", x, "t", {
-    rights: ["send"],
-    membranes: [{ kind: "spy", create: () => (ctx) => { c = ctx; return ctx.args; } }],
-  });
-  await rt.invoke(x, "t", { v: 1 });
-  assert.ok(Object.isFrozen(c));
-  assert.equal(c.actor, undefined);
-  assert.deepEqual(c.caller, Object.freeze({ id: x.id, label: "x" }));
 });
 
 /* ---------- scheduling: #9 explicit completion (F4, F9) ---------- */
@@ -218,11 +512,8 @@ test("tick() enforces deadlines against a hung handler; no pending leak (F4)", a
   T = 10;
   rt.tick();
   assert.equal(await asyncCode(promise), "E_TIMEOUT");
-  // the ledger records exactly one timeout outcome for the hung xact
   assert.equal(evs(rt, "invoke").filter((e) => e.xact === xact).length, 1);
-  // and a new transaction can take the old id's place: no #pending residue
   const p2 = rt.request(c, "t", {}, { deadline: 15 });
-  T = 20;
   rt.tick(20);
   assert.equal(await asyncCode(p2.promise), "E_TIMEOUT");
 });
@@ -262,6 +553,27 @@ test("abort signal cancels an in-flight request (M1 semantics)", async () => {
   release(1);
 });
 
+test("A10: signal listeners are detached on normal settle — no retention on long-lived signals (A10)", async () => {
+  const { rt, client } = setup(async (a) => a.v);
+  let live = 0;
+  const stubSignal = {
+    aborted: false,
+    addEventListener() { live += 1; },
+    removeEventListener() { live -= 1; },
+  };
+  for (let i = 0; i < 3; i++) await rt.invoke(client, "t", { v: i }, { signal: stubSignal });
+  assert.equal(live, 0); // every success/failure settled with its listener removed
+  // and cancellation via a real signal still works end-to-end
+  let release;
+  const { rt: rt2, client: c2 } = setup(() => new Promise((r) => (release = r)));
+  const ac = new AbortController();
+  const { promise } = rt2.request(c2, "t", {}, { signal: ac.signal });
+  ac.abort();
+  assert.equal(await asyncCode(promise), "E_CANCELLED");
+  release(1); // late settle must not throw: detach already ran, cancel() is idempotent
+  await turn();
+});
+
 test("cancellation cancels delivery, not side effects — journal says so (F9)", async () => {
   let sideEffects = 0;
   let release;
@@ -277,7 +589,7 @@ test("cancellation cancels delivery, not side effects — journal says so (F9)",
   assert.equal(sideEffects, 1); // honest: the world changed
   const inv = evs(rt, "invoke").find((e) => e.xact === xact);
   assert.equal(inv.outcome, "cancelled");
-  assert.ok(inv.delivery === "cancelled"); // outcome is about DELIVERY, not effects
+  assert.ok(inv.delivery === "cancelled");
 });
 
 /* ---------- queue liveness (F5, F6) ---------- */
@@ -288,60 +600,57 @@ function mboxSetup(onFull = "block", mailbox = 1) {
   const sender1 = rt.spawn("s1");
   const sender2 = rt.spawn("s2");
   const receiver = rt.spawn("r", { mailbox, onFull });
-  const root = rt.address(receiver);
-  rt.grantCap(root, sender1, "m", { rights: ["send"] });
-  rt.grantCap(root, sender2, "m", { rights: ["send"] });
-  return { rt, T, sender1, sender2, receiver };
+  wire(rt, sender1, receiver);
+  wire(rt, sender2, receiver);
+  const capOf = (who) => rt.holds(who, "m");
+  return { rt, T, sender1, sender2, receiver, capOf };
 }
 
 test("expired head unblocks the waiting sender on recv (F5)", async () => {
-  const { rt, T, sender1, sender2, receiver } = mboxSetup();
-  const first = rt.tell(sender1, receiver, { n: 1 }, { deadline: 10 });
-  assert.equal(first, true);
-  const blocked = rt.tell(sender2, receiver, { n: 2 });
-  assert.ok(blocked instanceof Promise);
+  const { rt, T, sender1, sender2, receiver, capOf } = mboxSetup();
+  assert.equal(rt.tell(sender1, capOf(sender1), { n: 1 }, { deadline: 10 }), true);
+  const blocked = rt.tell(sender2, capOf(sender2), { n: 2 });
+  assert.equal(typeof blocked.then, "function");
   T.now = 20;
   assert.equal(rt.recv(receiver), null); // skipped the expired head…
   assert.deepEqual(await blocked, { ok: true }); // …and promoted the blocked sender
-  const m = rt.recv(receiver);
-  assert.equal(m.msg.n, 2);
+  assert.equal(rt.recv(receiver).msg.n, 2);
 });
 
 test("cancelling a queued message promotes a waiter (F5b)", async () => {
-  const { rt, sender1, sender2, receiver } = mboxSetup();
-  rt.tell(sender1, receiver, { n: 1 });
+  const { rt, sender1, sender2, receiver, capOf } = mboxSetup();
+  rt.tell(sender1, capOf(sender1), { n: 1 });
   const queuedXact = evs(rt, "tell").at(-1).xact;
-  const blocked = rt.tell(sender2, receiver, { n: 2 });
-  assert.ok(blocked instanceof Promise);
+  const blocked = rt.tell(sender2, capOf(sender2), { n: 2 });
+  assert.equal(typeof blocked.then, "function");
   assert.equal(rt.cancel(queuedXact), true);
   assert.deepEqual(await blocked, { ok: true });
   assert.equal(rt.recv(receiver).msg.n, 2);
 });
 
 test("cancelling a blocked sender resolves {ok:false}, never rejects (F6)", async () => {
-  const { rt, sender1, sender2, receiver } = mboxSetup();
-  rt.tell(sender1, receiver, { n: 1 });
-  const blocked = rt.tell(sender2, receiver, { n: 2 });
+  const { rt, sender1, sender2, receiver, capOf } = mboxSetup();
+  rt.tell(sender1, capOf(sender1), { n: 1 });
+  const blocked = rt.tell(sender2, capOf(sender2), { n: 2 });
   const denied = evs(rt, "tell_blocked")[0];
   assert.equal(rt.cancel(denied.xact), true);
-  assert.deepEqual(await blocked, { ok: false, reason: "cancelled" }); // resolution, not rejection
+  assert.deepEqual(await blocked, { ok: false, reason: "cancelled" });
 });
 
 test("expired waiter resolves {ok:false, reason:'expired'} on tick (F5c, F6)", async () => {
-  const { rt, T, sender1, sender2, receiver } = mboxSetup();
-  rt.tell(sender1, receiver, { n: 1 });
-  const blocked = rt.tell(sender2, receiver, { n: 2 }, { deadline: 10 });
+  const { rt, T, sender1, sender2, receiver, capOf } = mboxSetup();
+  rt.tell(sender1, capOf(sender1), { n: 1 });
+  const blocked = rt.tell(sender2, capOf(sender2), { n: 2 }, { deadline: 10 });
   T.now = 20;
   rt.tick();
   assert.deepEqual(await blocked, { ok: false, reason: "expired" });
 });
 
 test("waiters are bounded; overflow sheds synchronously instead of growing memory (F6)", () => {
-  const { rt, sender1, sender2, receiver } = mboxSetup("block", 1); // waiterCap = 4
-  rt.tell(sender1, receiver, { n: 0 }); // fills mailbox
-  const pending = [];
-  for (let i = 0; i < 4; i++) pending.push(rt.tell(sender2, receiver, { n: i + 1 }));
-  assert.equal(syncCode(() => rt.tell(sender2, receiver, { n: 99 })), "E_SHED");
+  const { rt, sender1, sender2, receiver, capOf } = mboxSetup("block", 1); // waiterCap = 4
+  rt.tell(sender1, capOf(sender1), { n: 0 }); // fills mailbox
+  for (let i = 0; i < 4; i++) rt.tell(sender2, capOf(sender2), { n: i + 1 });
+  assert.equal(syncCode(() => rt.tell(sender2, capOf(sender2), { n: 99 })), "E_SHED");
   assert.equal(evs(rt, "shed").length, 1);
 });
 
@@ -349,122 +658,45 @@ test("shed mode: full mailbox rejects with E_SHED (M1 semantics)", () => {
   const rt = new Runtime();
   const s = rt.spawn("s");
   const r = rt.spawn("r", { mailbox: 1, onFull: "shed" });
-  rt.grantCap(rt.address(r), s, "m", { rights: ["send"] });
-  assert.equal(rt.tell(s, r, 1), true);
-  assert.equal(syncCode(() => rt.tell(s, r, 2)), "E_SHED");
+  const cap = wire(rt, s, r);
+  assert.equal(rt.tell(s, cap, 1), true);
+  assert.equal(syncCode(() => rt.tell(s, cap, 2)), "E_SHED");
 });
 
-/* ---------- value semantics across boundaries (F12) ---------- */
+/* ---------- F13, F14: branding and message values ---------- */
 
-test("messages and results cross by structured clone, not reference (F12)", async () => {
+test("messages cross by structured clone, not reference (F12)", () => {
   const rt = new Runtime();
   const a = rt.spawn("a");
   const b = rt.spawn("b");
-  rt.grantCap(rt.address(b), a, "m", { rights: ["send"] });
+  const cap = wire(rt, a, b);
   const m = { v: 1 };
-  rt.tell(a, b, m);
+  rt.tell(a, cap, m);
   m.v = 2; // sender-side mutation after send
   assert.equal(rt.recv(b).msg.v, 1); // receiver saw the value at send time
-
-  let retained;
-  const { server } = rt.serve("svc", "t", async (args) => {
-    retained = { v: args.v };
-    return retained;
-  });
-  const c = rt.spawn("c");
-  rt.grant(server, "t", c, "t", { rights: ["send"] });
-  const out = await rt.invoke(c, "t", { v: 1 });
-  retained.v = 99; // handler retains and mutates after completion
-  assert.equal(out.v, 1); // caller's copy untouched
 });
 
 test("payload identity is never trusted; sender is substrate-stamped (invariant #4 sim)", () => {
   const rt = new Runtime();
   const a = rt.spawn("a");
   const b = rt.spawn("b");
-  rt.grantCap(rt.address(b), a, "m", { rights: ["send"] });
-  rt.tell(a, b, { sender: "someone-else" });
-  const m = rt.recv(b);
-  assert.equal(m.sender, a.id);
+  const cap = wire(rt, a, b);
+  rt.tell(a, cap, { sender: "someone-else" });
+  assert.equal(rt.recv(b).sender, a.id);
 });
 
-/* ---------- canonical hashing (F11) ---------- */
-
-test("canonical hashes distinguish undefined/NaN and reject cycles without throwing (F11)", async () => {
-  const { rt, client } = setup();
-  await rt.invoke(client, "t", {});
-  await rt.invoke(client, "t", { a: undefined });
-  await rt.invoke(client, "t", { x: NaN });
-  await rt.invoke(client, "t", { x: null });
-  const [h1, h2, h3, h4] = evs(rt, "invoke").map((e) => e.argsHash);
-  assert.notEqual(h1, h2);
-  assert.notEqual(h3, h4);
-  assert.match(h1, /^[0-9a-f]{64}$/);
-
-  const cyc = { self: null };
-  cyc.self = cyc;
-  assert.equal(syncCode(() => rt.request(client, "t", cyc)), "E_CANON");
-  assert.equal(evs(rt, "invoke_denied").at(-1).code, "E_CANON"); // journaled, not silent
-
-  // cyclic RESULT still completes: outcome ok with explicit unhashable marker
-  const { server } = rt.serve("svc2", "t2", async () => {
-    const o = {};
-    o.me = o;
-    return o;
-  });
-  const c2 = rt.spawn("c2");
-  rt.grant(server, "t2", c2, "t2", { rights: ["send"] });
-  const res = await rt.invoke(c2, "t2", {});
-  assert.equal(res.me, res);
-  assert.equal(evs(rt, "invoke").at(-1).resultHash, "!unhashable");
-
-  // BigInt results hash instead of throwing inside the completion path
-  const { server: s3 } = rt.serve("svc3", "t3", async () => 10n);
-  const c3 = rt.spawn("c3");
-  rt.grant(s3, "t3", c3, "t3", { rights: ["send"] });
-  assert.equal(await rt.invoke(c3, "t3", {}), 10n);
-  assert.match(evs(rt, "invoke").at(-1).resultHash, /^[0-9a-f]{64}$/);
-});
-
-/* ---------- transaction identity (F13, F14) ---------- */
-
-test("caller xacts collide only with live transactions; messages get fresh ids (F13)", async () => {
-  const rt = new Runtime();
-  const a = rt.spawn("a");
-  const b = rt.spawn("b");
-  rt.grantCap(rt.address(b), a, "m", { rights: ["send"] });
-  assert.equal(rt.tell(a, b, 1, { xact: "dup" }), true);
-  assert.equal(syncCode(() => rt.tell(a, b, 2, { xact: "dup" })), "E_INVAL");
-  assert.equal(evs(rt, "deliver_denied").at(-1).code, "E_INVAL");
-  // after delivery, ids may be reused without ambiguity with LIVE state
-  rt.recv(b);
-  assert.equal(rt.tell(a, b, 3, { xact: "dup" }), true);
-  // auto-generated message ids never collide with request ids
-  const { server } = rt.serve("svc", "t", async () => 1);
-  const c = rt.spawn("c");
-  rt.grant(server, "t", c, "t", { rights: ["send"] });
-  const req = rt.request(c, "t", {});
-  assert.equal(syncCode(() => rt.tell(a, b, 4, { xact: req.xact })), "E_INVAL");
-  rt.cancel(req.xact);
-  await asyncCode(req.promise);
-});
-
-test("actors and capabilities are runtime-branded: E_FOREIGN everywhere (F14)", async () => {
+test("actors and capabilities are runtime-branded: E_FOREIGN everywhere (F14)", () => {
   const rtA = new Runtime();
   const rtB = new Runtime();
   const a = rtA.spawn("a");
   const bB = rtB.spawn("b");
-  rtA.grantCap(rtA.address(rtA.spawn("x")), a, "x", { rights: ["send"] });
-  assert.equal(syncCode(() => rtA.tell(a, bB, {})), "E_FOREIGN");
-  assert.equal(evs(rtA, "deliver_denied").at(-1).code, "E_FOREIGN");
+  assert.equal(syncCode(() => rtB.tell(bB, rtA.address(rtA.spawn("z")), {})), "E_FOREIGN");
+  assert.equal(evs(rtB, "deliver_denied").at(-1).code, "E_FOREIGN");
   assert.equal(syncCode(() => rtA.recv(bB)), "E_FOREIGN");
   assert.equal(syncCode(() => rtA.address(bB)), "E_FOREIGN");
-  const capA = rtA.endpoint("t", async () => 1);
-  const bActor = rtB.spawn("bb");
-  assert.equal(syncCode(() => rtB.grantCap(capA, bActor, "t", { rights: ["send"] })), "E_FOREIGN");
 });
 
-/* ---------- audit completeness (F7, F8, F10) ---------- */
+/* ---------- audit completeness (F8) ---------- */
 
 test("every denial class is journaled at the chokepoint (F8)", async () => {
   const { rt, server } = setup();
@@ -473,44 +705,30 @@ test("every denial class is journaled at the chokepoint (F8)", async () => {
   assert.equal(evs(rt, "invoke_denied").at(-1).code, "E_NO_CAP");
   assert.ok(evs(rt, "invoke_denied").at(-1).xact);
   await asyncCode(rt.invoke(x, "t", {}));
+  assert.equal(evs(rt, "invoke_denied").at(-1).xact !== evs(rt, "invoke_denied").at(-2).xact, true);
   assert.equal(syncCode(() => rt.grant(x, "empty", server, "s")), "E_NO_CAP");
   assert.equal(evs(rt, "grant_denied").at(-1).code, "E_NO_CAP");
   assert.equal(syncCode(() => rt.grant(server, "t", x, "s", { rights: ["bogus"] })), "E_INVAL");
   assert.equal(evs(rt, "grant_denied").at(-1).code, "E_INVAL");
-  const denied = evs(rt, "invoke_denied").length;
-  assert.ok(denied >= 2);
+  // source-cap revocation denial on grant
+  const root = rt.address(x);
+  rt.revoke(root);
+  assert.equal(syncCode(() => rt.grantCap(root, x, "s2")), "E_REVOKED");
+  assert.equal(evs(rt, "grant_denied").at(-1).code, "E_REVOKED");
+  assert.ok(evs(rt, "invoke_denied").length >= 2);
 });
 
-test("allow path journals the full quad; chain verifies and detects tampering (F10 wording)", async () => {
+test("allow path journals the full quad; chain verifies (F10 wording)", async () => {
   const { rt, client } = setup();
   await rt.invoke(client, "t", { v: "7" });
   const inv = evs(rt, "invoke").at(-1);
   for (const k of ["xact", "actor", "tool", "outcome", "argsHash", "resultHash"]) assert.ok(k in inv, k);
-  assert.equal(rt.journal.verify(), true);
-  rt.journal.entries[3].event.outcome = "ok?";
-  assert.equal(rt.journal.verify(), false); // internal hash-consistency, documented scope
-});
-
-test("bench sink is an explicit non-conforming configuration, journal events still generated (F7)", async () => {
-  const plain = new Runtime();
-  assert.equal(plain.conforming, true);
-  const bench = new Runtime({ bench: true });
-  assert.equal(bench.conforming, false);
-  const { server } = bench.serve("svc", "t", async () => 1);
-  const c = bench.spawn("c");
-  bench.grant(server, "t", c, "t", { rights: ["send"] });
-  await bench.invoke(c, "t", { v: 1 });
-  const inv = evs(bench, "invoke").at(-1);
-  assert.equal(inv.argsHash, "!bench");
-  assert.ok(bench.journal.entries.length >= 4); // spawn+grant+invoke: events exist
-  assert.equal(bench.journal.entries.at(-1).hash, "!bench"); // only crypto is replaced
-  // and there is no other way to silence the journal
-  assert.equal(await asyncCode(new Runtime({ journal: false }).invoke(c, "t", {})), "E_FOREIGN");
+  assert.equal(rt.verifyJournal(), true);
 });
 
 /* ---------- happy paths ---------- */
 
-test("request/invoke success, distinct xacts, deterministic key-order-insensitive hashes", async () => {
+test("request/invoke success, distinct xacts, deterministic hashes", async () => {
   const { rt, client } = setup();
   const r1 = await rt.invoke(client, "t", { v: "a" });
   const r2 = await rt.invoke(client, "t", { v: "a" });
@@ -520,15 +738,6 @@ test("request/invoke success, distinct xacts, deterministic key-order-insensitiv
   assert.notEqual(e1.xact, e2.xact);
   assert.equal(e1.argsHash, e2.argsHash);
   assert.equal(e1.resultHash, e2.resultHash);
-
-  const rt2 = new Runtime();
-  const { server } = rt2.serve("svc", "t", async (a) => a);
-  const c = rt2.spawn("c");
-  rt2.grant(server, "t", c, "t", { rights: ["send"] });
-  await rt2.invoke(c, "t", { b: 2, a: 1 });
-  await rt2.invoke(c, "t", { a: 1, b: 2 });
-  const [k1, k2] = evs(rt2, "invoke").map((e) => e.argsHash);
-  assert.equal(k1, k2); // canonical: sorted keys
 });
 
 test("spawn validates options synchronously", () => {
@@ -537,16 +746,14 @@ test("spawn validates options synchronously", () => {
   assert.equal(syncCode(() => rt.spawn("x", { onFull: "block" })), null);
 });
 
-test("recv by owner + full send/recv round trip with attenuated caps", async () => {
+test("recv is self-service via the control handle; full round trip with attenuated caps (A7)", () => {
   const rt = new Runtime();
   const svc = rt.spawn("svc");
   const agent = rt.spawn("agent");
   const root = rt.address(svc);
-  rt.grantCap(root, agent, "svc-in", { rights: ["send"] });
-  // recv right cannot be delegated to another actor for svc's mailbox unless granted
-  rt.grantCap(root, svc, "svc-in", { rights: ["recv"] });
-  assert.equal(rt.tell(agent, svc, { job: 42 }), true);
-  const m = rt.recv(svc);
+  const sendCap = rt.grantCap(root, agent, "svc-in", { rights: ["send"] });
+  assert.equal(rt.tell(agent, sendCap, { job: 42 }), true);
+  const m = rt.recv(svc); // possession of the controller IS the receive authority
   assert.equal(m.msg.job, 42);
   assert.equal(m.sender, agent.id);
 });

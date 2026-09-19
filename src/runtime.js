@@ -1,21 +1,53 @@
 /**
- * Agamen v1.5 — hardened substrate: actors + object capabilities +
- * membranes + provenance + scheduling semantics.
+ * Agamen v1.6 — authority-handle split + strict value discipline.
  *
- * Response to external review of v1 (20 findings). The enforcement model is
- * now "hostile same-realm JS code": capabilities and actors are opaque
- * tokens whose authority state lives in runtime-private WeakMaps, so no
- * holder-side mutation can forge rights, un-revoke, drop membranes, or
- * reach a target — in-realm, before any transport boundary. Messages and
- * results cross principal boundaries by structured clone, never by shared
- * reference. Deadline/cancel settle the caller-facing outcome via cancel()
- * and tick() regardless of whether the handler ever returns.
+ * Response to the internal re-audit of v1.5 (5 BLOCKERs / 4 MAJORs). Three
+ * changes of principle:
+ *
+ * 1. THREE HANDLES, NOT ONE. A principal is reached by three distinct
+ *    tokens: the public ActorId (a frozen {id,label} snapshot — comparable,
+ *    displayable, accepted by NO privileged call), the ActorControl handle
+ *    (principal-private controller: recv / request / holds / slot writes),
+ *    and MailboxCap capabilities (the only authority to tell() an actor).
+ *    v1.5 conflated all three into one token, so holding a target's
+ *    reference minted its root mailbox cap, read its mailbox, and ran its
+ *    slots. That bypass class is closed by construction: identityOf(control)
+ *    gives out something the runtime refuses to accept anywhere privileged.
+ *
+ * 2. THREAT MODEL CHOSEN, NOT AMBIGUOUS (audit #5, option A). The Runtime
+ *    object is the TRUSTED CONTROL PLANE: spawn/grant/revoke/tick/cancel/
+ *    address are host APIs, not a boundary hostile code faces. The adversary
+ *    is realm code that legitimately holds capability tokens, its own
+ *    ActorControl, exposed ActorIds, and handler/membrane roles. Against
+ *    that adversary: authority state is WeakMap-private (rights unforgeable,
+ *    revocation not holder-reversible, membranes undroppable), slot
+ *    installation requires the target's control handle (consent), and the
+ *    audit journal is a private sink — rt.journal no longer exists;
+ *    verifyJournal() / journalEntries() are read-only views.
+ *
+ * 3. CLONE-OR-FAIL, BOTH DIRECTIONS, NO FALLBACKS. Invocation arguments are
+ *    structured-cloned at admission (membranes and handlers never receive a
+ *    caller-owned mutable object); results that cannot cross by clone FAIL
+ *    the xact (E_CLONE) — v1.5's shared-reference fallback is deleted.
+ *    Hashed values must live in the frozen plain domain (null/bool/finite
+ *    number/string/bigint/array/plain-object); Date/Map/Set/class-instances/
+ *    undefined are rejected (E_DOMAIN), which with type-tagged canonical
+ *    encoding removes the v1.5 sentinel/string collisions. A total,
+ *    collision-free argument digest is a precondition for M2 approvals —
+ *    which therefore stay blocked until this layer is proven.
+ *
+ * Also fixed: internal xact ids are runtime-lifetime unique (the ledger
+ * never rebinds an id; user labels move to `correlationId`); slot
+ * overwrites need explicit consent (E_OCCUPIED); grant/revoke foreign
+ * denials are journaled; AbortSignal listeners are removed on settle; the
+ * rights algebra is {send, grant} — v1.5's `recv`/`revoke` were decorative
+ * and are removed (mailbox reads are control-handle possession; subtree
+ * revocation is a host act, journaled).
  *
  * Still true (documented deviations): handlers are not preempted in-process
- * (M3 transports); identity is a runtime-branded reference, not an
- * unforgeable transport stamp (#4, M3); the journal is in-memory and
- * internally hash-consistent for the process lifetime — external anchoring
- * and signing are future work (#10 wording in spec/invariants.md).
+ * (enforcement track E2); identity is runtime-branded, not a transport
+ * stamp (#4, E2); the journal is in-memory and internally hash-consistent
+ * for the process lifetime — external anchoring is E2/E3 work (#10).
  */
 
 import { createHash } from "node:crypto";
@@ -23,34 +55,50 @@ import { createHash } from "node:crypto";
 const sha256 = (v) =>
   createHash("sha256").update(typeof v === "string" ? v : JSON.stringify(v)).digest("hex");
 
-const UNHASHABLE = "!unhashable";
+const UNHASHABLE = Symbol("unhashable");
 const BENCH_HASH = () => "!bench";
 
-/* Canonical, total serialization: sorted keys, non-JSON atoms tagged so
- * {} vs {a:undefined} and NaN vs null never collide; only cycles fail, and
- * failure is a value (UNHASHABLE), never a throw inside a completion path. */
-function canonicalize(v, seen) {
-  if (v === null) return null;
-  if (v === undefined) return "!undef";
+class DomainError extends Error {}
+
+/* Frozen value domain, type-safely encoded: every value becomes [tag, ...]
+ * so no string can alias another type's representation (v1.5 collision:
+ * undefined ≡ "!undef", which a hostile caller could also pass as the
+ * literal string). plain object = own enumerable string keys, Object/null
+ * prototype. Out of domain: undefined, functions, symbols, non-finite
+ * numbers, Date/Map/Set/typed arrays/class instances, array holes. */
+function canonEncode(v, seen) {
+  if (v === null) return ["~"];
   const t = typeof v;
-  if (t === "bigint" || t === "function" || t === "symbol") return `!${t}:${String(v)}`;
-  if (t === "number" && !Number.isFinite(v)) return `!num:${String(v)}`;
-  if (t !== "object") return v; // string | number | boolean | undefined
-  if (seen.has(v)) throw new SubstrateError("E_CANON", "cyclic value");
-  seen.add(v);
+  if (t === "boolean") return ["b", v];
+  if (t === "number") {
+    if (!Number.isFinite(v)) throw new DomainError("non-finite number");
+    return ["n", Object.is(v, -0) ? "0" : v];
+  }
+  if (t === "string") return ["s", v];
+  if (t === "bigint") return ["i", String(v)];
+  if (t !== "object") throw new DomainError(`type '${t}' is out of the value domain`);
+  // cycles are not a finite tree: reject before recursion overflows the stack
+  const s = seen || new WeakSet();
+  if (s.has(v)) throw new DomainError("cyclic value");
+  s.add(v);
   try {
-    if (Array.isArray(v)) return v.map((x) => canonicalize(x, seen));
-    const o = {};
-    for (const k of Object.keys(v).sort()) o[k] = canonicalize(v[k], seen);
-    return o;
+    if (Array.isArray(v)) return ["a", v.map((x) => canonEncode(x, s))];
+    const p = Object.getPrototypeOf(v);
+    // Cross-realm-safe plain check: a plain object's prototype chain bottoms
+    // out at null one step at or above Object.prototype. Date/Map/Set/class
+    // instances have Object.prototype two steps up, so they are rejected
+    // even when they arrive from another realm (structuredClone in some
+    // embedders produces objects whose Object.prototype differs by identity).
+    if (p !== null && Object.getPrototypeOf(p) !== null) throw new DomainError("not a plain object");
+    return ["o", Object.keys(v).sort().map((k) => [k, canonEncode(v[k], s)])];
   } finally {
-    seen.delete(v);
+    s.delete(v);
   }
 }
 
 const canonSha = (v) => {
   try {
-    return sha256(canonicalize(v, new Set()));
+    return sha256(JSON.stringify(canonEncode(v)));
   } catch {
     return UNHASHABLE;
   }
@@ -64,15 +112,25 @@ export class SubstrateError extends Error {
   }
 }
 
-/* ---------- Provenance: append-only, hash-chained journal ---------- */
+/* clone-or-fail: the only way a value crosses a principal boundary. */
+function cloneOrFail(v) {
+  try {
+    return structuredClone(v);
+  } catch {
+    throw new SubstrateError("E_CANON", "value is not structurally cloneable");
+  }
+}
 
-export class Provenance {
+/* ---------- Provenance: append-only, hash-chained journal ----------
+ * Not exported and not reachable from outside: Runtime holds it in a
+ * private field and exposes only verifyJournal()/journalEntries().
+ * `rt.journal = ...` creates an inert own property; the internal append
+ * path is `this.#journal.append` and cannot be swapped (audit #3). */
+
+class Provenance {
   entries = [];
   #hash;
 
-  /** A non-conforming sink may swap the hasher (bench); events are still
-   *  generated — only the crypto is replaced, and the Runtime that chose it
-   *  is flagged `conforming: false`. */
   constructor({ hash = sha256 } = {}) {
     this.#hash = hash;
   }
@@ -96,14 +154,17 @@ export class Provenance {
   }
 }
 
-const VALID_RIGHTS = new Set(["send", "recv", "grant", "revoke"]);
+/* v1.6 rights algebra: send = invoke/tell; grant = derive attenuated caps.
+ * `recv` and `revoke` were removed as non-delegable: reading a mailbox is
+ * possession of the principal's control handle, and revoking a subtree is
+ * an act of the trusted plane. */
+const VALID_RIGHTS = new Set(["send", "grant"]);
 
 /* ---------- Membranes: factories; per-derivation instantiated state ----------
- * Budget scope is defined explicitly (review #15): a membrane's state
- * belongs to the grant that attached it and is shared by that cap's whole
- * derivation subtree; sibling subtrees get independent counters.
- * Membranes run in attachment order and charge their budget on the
- * ATTEMPT, before later membranes veto (charged-attempt semantics). */
+ * Budget scope: a membrane's state belongs to the grant that attached it
+ * and is shared by that cap's whole derivation subtree; sibling subtrees
+ * get independent counters. Membranes run in attachment order and charge
+ * their budget on the ATTEMPT, before later membranes veto. */
 
 export const rateLimit = (maxCalls) => ({
   kind: "rateLimit",
@@ -127,40 +188,58 @@ export const policy = (fn, msg = "rejected by policy") => ({
   },
 });
 
-/* ---------- Actor / Capability: opaque tokens ----------
- * Holders see a frozen identity-only token. All authority state (rights,
- * target, membranes, revocation, lineage) lives in runtime WeakMaps keyed
- * by the token: unforgeable, unenumerable, and unreachable by holder-side
- * code — including code that enumerates symbols or deep-freezes objects. */
-
 /* ---------- Runtime ---------- */
 
 export class Runtime {
-  journal;
-  conforming = true;
-
   #now;
   #h;
+  #conforming = true;
+  #journal;
+
   #nextActor = 1;
   #seq = 0;
-  #actors = new WeakMap(); // actor token -> private state
-  #caps = new WeakMap();   // cap token  -> private record
+  #actors = new WeakMap(); // ActorControl token -> private state
+  #caps = new WeakMap();   // cap token          -> private record
   #pending = new Map();    // request xact -> request record
-  #queued = new Map();     // message xact -> { st, kind: "mbox" | "waiter", ... }
+  #queued = new Map();     // message xact -> { st, kind, ... }
 
   /** `bench: true` selects a non-conforming, constant-time audit sink for
-   *  cost-model fitting only; it is reported on `rt.conforming`, never
-   *  silently off. There is no way to disable the journal itself. */
+   *  cost-model fitting only; `rt.conforming` reports it. The journal
+   *  cannot be disabled or reached: verifyJournal()/journalEntries() are
+   *  the only views, both snapshot-only. */
   constructor({ now = () => globalThis.performance.now(), bench = false } = {}) {
     this.#now = now;
     this.#h = bench ? BENCH_HASH : canonSha;
-    if (bench) this.conforming = false;
-    this.journal = new Provenance({ hash: bench ? BENCH_HASH : sha256 });
+    if (bench) this.#conforming = false;
+    this.#journal = new Provenance({ hash: bench ? BENCH_HASH : sha256 });
+  }
+
+  /* ===== read-only audit views ===== */
+
+  get conforming() {
+    return this.#conforming;
+  }
+
+  verifyJournal() {
+    return this.#journal.verify();
+  }
+
+  /** Snapshot copy — mutating the result cannot touch the ledger. */
+  journalEntries() {
+    return this.#journal.entries.map((e) => structuredClone(e));
+  }
+
+  /** Trusted-plane hook for higher layers (e.g. src/intent.js) to record
+   *  facts in the same ledger. It appends; it grants no authority. */
+  record(event) {
+    return this.#journal.append(event);
   }
 
   #A(token) {
     const st = this.#actors.get(token);
-    if (!st) throw new SubstrateError("E_FOREIGN", "actor is not owned by this runtime");
+    if (!st) {
+      throw new SubstrateError("E_FOREIGN", "not an ActorControl handle of this runtime (public ActorIds are accepted nowhere privileged)");
+    }
     return st;
   }
 
@@ -170,21 +249,23 @@ export class Runtime {
     return rec;
   }
 
+  #x(prefix) {
+    return `${prefix}${++this.#seq}`; // runtime-lifetime unique; never reused
+  }
+
   #mint(rec) {
     const token = Object.freeze({ id: `c${++this.#seq}` });
     this.#caps.set(token, { children: [], revoked: false, instances: [], ...rec });
     return token;
   }
 
-  /* ===== actors ===== */
+  /* ===== actors: control handle vs public identity ===== */
 
   spawn(label, { mailbox = 64, onFull = "shed" } = {}) {
-    if (onFull !== "shed" && onFull !== "block") {
-      throw new SubstrateError("E_INVAL", "onFull: shed|block");
-    }
-    const token = Object.freeze({ id: this.#nextActor++, label: label ?? null });
-    this.#actors.set(token, {
-      token,
+    if (onFull !== "shed" && onFull !== "block") throw new SubstrateError("E_INVAL", "onFull: shed|block");
+    const control = Object.freeze({ id: this.#nextActor++, label: label ?? null });
+    this.#actors.set(control, {
+      token: control,
       slots: new Map(),
       mbox: [],
       waiters: [],
@@ -193,32 +274,38 @@ export class Runtime {
       onFull,
       mboxCapToken: null,
     });
-    this.journal.append({ t: "spawn", actor: token.id, label: token.label });
-    return token;
+    this.#journal.append({ t: "spawn", actor: control.id, label: control.label });
+    return control;
   }
 
-  /** Root capability over an actor's mailbox. Distributing it is the ONLY
-   *  way to grant anyone (including other runtimes' notions of "public
-   *  address") the right to tell() that actor — messaging is mediated
-   *  (invariant #3). The root itself is not ambient: it lives with whoever
-   *  the system hands it to, and attenuates/revokes like any cap. */
-  address(actorToken) {
-    const st = this.#A(actorToken);
+  /** The public handle: comparable and displayable, rejected by every
+   *  privileged call (it is not a key into #actors). The only form of an
+   *  actor that may be shown to other principals. */
+  identityOf(control) {
+    const st = this.#A(control);
+    return Object.freeze({ id: st.token.id, label: st.token.label });
+  }
+
+  /** Root mailbox capability. Requires the control handle — an ActorId
+   *  mints nothing. Distributing attenuations of it is the only way to
+   *  let anyone tell() this actor (#3). */
+  address(control) {
+    const st = this.#A(control);
     if (!st.mboxCapToken) {
       st.mboxCapToken = this.#mint({
         kind: "actor",
-        target: actorToken,
-        name: `mailbox:${actorToken.id}`,
-        rights: new Set(["send", "recv", "grant", "revoke"]),
+        target: st.token, // private control token — never handed out
+        name: `mailbox:${st.token.id}`,
+        rights: new Set(["send", "grant"]),
       });
     }
     return st.mboxCapToken;
   }
 
-  holds(actorToken, slot) {
-    const st = this.#A(actorToken);
+  holds(control, slot) {
+    const st = this.#A(control);
     const tok = st.slots.get(slot);
-    if (!tok) throw new SubstrateError("E_NO_CAP", `actor ${actorToken.id} holds no capability at slot '${slot}'`);
+    if (!tok) throw new SubstrateError("E_NO_CAP", `actor ${st.token.id} holds no capability at slot '${slot}'`);
     return tok;
   }
 
@@ -232,7 +319,7 @@ export class Runtime {
 
   /* ===== capabilities ===== */
 
-  endpoint(name, handler, { rights = ["send", "recv", "grant", "revoke"] } = {}) {
+  endpoint(name, handler, { rights = ["send", "grant"] } = {}) {
     for (const r of rights) if (!VALID_RIGHTS.has(r)) throw new SubstrateError("E_INVAL", `unknown right '${r}'`);
     return this.#mint({ kind: "endpoint", target: { handler }, name: String(name), rights: new Set(rights) });
   }
@@ -244,49 +331,53 @@ export class Runtime {
     return { server, cap };
   }
 
-  /** Derive a child capability from an actor's slot and install it on `to`. */
-  grant(from, fromSlot, to, toSlot, opts = {}) {
+  /** Derive a child capability from an actor's slot and install it on the
+   *  target actor — whose CONTROL handle must be presented (consent). */
+  grant(fromControl, fromSlot, toControl, toSlot, opts = {}) {
     let srcTok;
     try {
-      srcTok = this.#A(from).slots.get(fromSlot);
+      srcTok = this.#A(fromControl).slots.get(fromSlot);
     } catch (e) {
-      this.#grantDenied(from, to, toSlot, `x${this.#seq}`, e.code ?? "E_FOREIGN");
+      this.#grantDenied(fromControl, toControl, toSlot, e.code ?? "E_FOREIGN");
       throw e;
     }
     if (!srcTok) {
-      this.#grantDenied(from, to, toSlot, `x${this.#seq}`, "E_NO_CAP");
+      this.#grantDenied(fromControl, toControl, toSlot, "E_NO_CAP");
       throw new SubstrateError("E_NO_CAP", "source slot empty");
     }
-    return this.grantCap(srcTok, to, toSlot, opts);
-  }
-
-  #grantDenied(from, to, toSlot, gx, code) {
-    this.journal.append({
-      t: "grant_denied", xact: gx, from: from?.id ?? null, to: to?.id ?? null, slot: toSlot, code,
-    });
-  }
-
-  /** Derive from a capability token directly — the distribution path for
-   *  root mailbox caps from `address()`, which live outside any slot table
-   *  (zero ambient authority, #1, stays literally true). Authority checks
-   *  are identical either way. */
-  grantCap(srcTok, to, toSlot, { rights, membranes = [] } = {}) {
-    const gx = `x${++this.#seq}`;
-    let srcId = null;
     try {
-      srcId = this.#C(srcTok).target?.id ?? null;
-    } catch {}
+      this.#A(toControl);
+    } catch (e) {
+      this.#grantDenied(fromControl, toControl, toSlot, e.code);
+      throw e;
+    }
+    return this.grantCap(srcTok, toControl, toSlot, opts);
+  }
+
+  /** Derive from a held capability token into a slot of the actor whose
+   *  control handle is presented. There is no way to install into an actor
+   *  you were not given control of — the v1.5 slot-hijack (attacker mints
+   *  an evil endpoint, grantCaps it onto the victim's slot) is
+   *  constructively impossible, and overwriting an occupied slot needs an
+   *  explicit `overwrite: true` from whoever holds the controller. */
+  grantCap(srcTok, toControl, toSlot, { rights, membranes = [], overwrite = false } = {}) {
+    const gx = this.#x("g");
     const deny = (code, msg) => {
-      this.#grantDenied(srcId, to, toSlot, gx, code);
+      this.#journal.append({ t: "grant_denied", xact: gx, to: toControl?.id ?? null, slot: toSlot, code });
       throw new SubstrateError(code, msg);
     };
+    let src;
+    try {
+      src = this.#C(srcTok);
+    } catch {
+      deny("E_FOREIGN", "source capability not minted by this runtime");
+    }
     let toSt;
     try {
-      toSt = this.#A(to);
-    } catch (e) {
-      deny(e.code, e.message);
+      toSt = this.#A(toControl);
+    } catch {
+      deny("E_FOREIGN", "destination is not a control handle owned by this runtime");
     }
-    const src = this.#C(srcTok);
     if (src.revoked) deny("E_REVOKED", "source capability is revoked");
     if (!src.rights.has("grant")) deny("E_RIGHTS", "delegation requires the 'grant' right");
     const next = rights ? [...rights] : [...src.rights];
@@ -309,15 +400,34 @@ export class Runtime {
       instances: [...src.instances, ...created],
     });
     src.children.push(child);
+    if (!overwrite && toSt.slots.has(toSlot)) {
+      deny("E_OCCUPIED", `slot '${toSlot}' on actor ${toSt.token.id} is occupied`);
+    }
     toSt.slots.set(toSlot, child);
-    this.journal.append({
-      t: "grant", xact: gx, to: to.id, tool: src.name, slot: toSlot, rights: next,
+    this.#journal.append({
+      t: "grant", xact: gx, to: toSt.token.id, tool: src.name, slot: toSlot, rights: next,
     });
     return child;
   }
 
+  #grantDenied(fromControl, toControl, toSlot, code) {
+    this.#journal.append({
+      t: "grant_denied", xact: this.#x("g"),
+      from: fromControl?.id ?? null, to: toControl?.id ?? null, slot: toSlot, code,
+    });
+  }
+
+  /** Subtree revocation — a trusted-plane act (host/scheduler), journaled.
+   *  Holders of a capability token cannot un-revoke; descendants die with
+   *  the root (#6). Foreign tokens are denied AND journaled (audit #6). */
   revoke(capToken) {
-    const root = this.#C(capToken);
+    let root;
+    try {
+      root = this.#C(capToken);
+    } catch (e) {
+      this.#journal.append({ t: "revoke_denied", xact: this.#x("g"), code: e.code });
+      throw e;
+    }
     const queue = [root];
     while (queue.length) {
       const rec = queue.pop();
@@ -325,109 +435,141 @@ export class Runtime {
       rec.revoked = true;
       for (const childTok of rec.children) queue.push(this.#C(childTok));
     }
-    this.journal.append({ t: "revoke", tool: root.name });
+    this.#journal.append({ t: "revoke", tool: root.name });
   }
 
-  /* ===== mediated invocation ===== */
+  /* ===== mediated invocation =====
+   * `control` is ALWAYS an ActorControl handle: an actor's slot table may
+   * only be driven by whoever holds its controller. */
 
-  request(actor, slot, args, { deadline = null, signal = null } = {}) {
-    const x = `x${++this.#seq}`;
+  request(control, slot, args, { deadline = null, signal = null, correlationId = null } = {}) {
+    const x = this.#x("x");
+    const corr = correlationId !== null ? { correlationId } : {};
     const deny = (code, msg) => {
-      this.journal.append({ t: "invoke_denied", xact: x, actor: actor?.id ?? null, slot, code });
+      this.#journal.append({ t: "invoke_denied", xact: x, actor: control?.id ?? null, slot, code, ...corr });
       throw new SubstrateError(code, msg);
     };
     let st;
     try {
-      st = this.#A(actor);
+      st = this.#A(control);
     } catch {
-      deny("E_FOREIGN", "actor not owned by this runtime");
+      deny("E_FOREIGN", "not a control handle owned by this runtime");
     }
     const capTok = st.slots.get(slot);
     if (!capTok) deny("E_NO_CAP", `no capability at slot '${slot}'`);
     const rec = this.#C(capTok);
     if (rec.revoked) deny("E_REVOKED", `capability '${rec.name}' is revoked`);
+    if (rec.kind !== "endpoint") deny("E_RIGHTS", "slot holds no invokable endpoint");
     if (!rec.rights.has("send")) deny("E_RIGHTS", "missing 'send' right");
     if (signal?.aborted) deny("E_CANCELLED", "cancelled before admission");
     if (deadline !== null && this.#now() >= deadline) {
       deny("E_DEADLINE", "deadline passed before admission; handler not executed");
     }
-    let margs = args;
+    /* isolation begins before policy: membranes never see the caller's
+     * object graph, and neither does the handler (audit #2). */
+    let margs;
+    try {
+      margs = cloneOrFail(args);
+    } catch {
+      deny("E_CANON", "arguments are not structurally cloneable");
+    }
     const frozenCtx = Object.freeze({
       xact: x,
-      caller: Object.freeze({ id: actor.id, label: actor.label }),
+      caller: Object.freeze({ id: st.token.id, label: st.token.label }),
       tool: rec.name,
     });
+    let rewrote = false;
     for (const inst of rec.instances) {
       let out;
       try {
         out = inst(Object.freeze({ ...frozenCtx, args: margs }));
       } catch (e) {
-        this.journal.append({ t: "invoke_denied", xact: x, actor: actor.id, slot, code: e.code ?? "E_MEMBRANE" });
+        this.#journal.append({ t: "invoke_denied", xact: x, actor: st.token.id, slot, code: e.code ?? "E_MEMBRANE" });
         throw e;
       }
-      if (out !== undefined) margs = out;
+      if (out !== undefined) {
+        margs = out;
+        rewrote = true;
+      }
+    }
+    if (rewrote) {
+      try {
+        margs = cloneOrFail(margs); // membrane returned a live object: re-isolate
+      } catch {
+        deny("E_CANON", "membrane-rewritten arguments are not structurally cloneable");
+      }
     }
     const argsHash = this.#h(margs);
-    if (argsHash === UNHASHABLE) deny("E_CANON", "arguments are not canonically hashable (cycle?)");
+    if (argsHash === UNHASHABLE) deny("E_DOMAIN", "arguments are outside the canonical value domain");
 
     let resolve_, reject_;
     const promise = new Promise((res, rej) => { resolve_ = res; reject_ = rej; });
     const r = {
-      x: x, actorId: actor.id, tool: rec.name, argsHash, deadline,
+      x, actorId: st.token.id, tool: rec.name, argsHash, deadline, correlationId,
       settled: false, handlerSettled: false,
-      resolve: resolve_, reject: reject_, promise,
+      resolve: resolve_, reject: reject_, promise, detach: null, settle: null,
     };
+    if (signal) {
+      const onAbort = () => this.cancel(x);
+      signal.addEventListener("abort", onAbort, { once: true });
+      r.detach = () => signal.removeEventListener("abort", onAbort); // audit #10
+    }
     this.#pending.set(x, r);
-    if (signal) signal.addEventListener("abort", () => this.cancel(x), { once: true });
 
-    const settle = (outcome, err, resultHash) => {
-      if (r.settled) return;
+    r.settle = (outcome, resultHash) => {
+      if (r.settled) return false;
       r.settled = true;
       this.#pending.delete(x);
-      const ev = { t: "invoke", xact: x, actor: r.actorId, tool: r.tool, outcome, argsHash: r.argsHash };
+      r.detach?.();
+      const ev = { t: "invoke", xact: x, actor: r.actorId, tool: r.tool, outcome, argsHash: r.argsHash, ...corr };
       if (resultHash) ev.resultHash = resultHash;
-      this.journal.append(ev);
+      this.#journal.append(ev);
+      return true;
     };
 
     let h;
     try {
       h = rec.target.handler(margs, frozenCtx);
     } catch (err) {
-      settle("fail");
+      r.settle("fail");
       throw err;
     }
     Promise.resolve(h).then(
       (result) => {
         r.handlerSettled = true;
         if (r.settled) {
-          this.journal.append({ t: "handler_settled", xact: x });
+          this.#journal.append({ t: "handler_settled", xact: x });
           return;
         }
         if (r.deadline !== null && this.#now() > r.deadline) {
-          settle("timeout");
+          r.settle("timeout");
           r.reject(new SubstrateError("E_TIMEOUT", `xact ${x} completed past deadline; result not delivered`));
           return;
         }
-        let delivered = result;
-        let rh;
+        let delivered;
         try {
-          delivered = structuredClone(result);
+          delivered = cloneOrFail(result); // no shared-reference fallback
         } catch {
-          // result cannot cross a real boundary either; keep identity, flag it
-          delivered = result;
-          rh = UNHASHABLE;
+          r.settle("fail");
+          r.reject(new SubstrateError("E_CLONE", `xact ${x}: result cannot cross by clone`));
+          return;
         }
-        if (rh === undefined) rh = this.#h(delivered);
-        settle("ok", null, rh);
+        const rh = this.#h(delivered);
+        if (rh === UNHASHABLE) {
+          r.settle("fail");
+          r.reject(new SubstrateError("E_DOMAIN", `xact ${x}: result is outside the canonical value domain`));
+          return;
+        }
+        r.settle("ok", rh);
         r.resolve(delivered);
       },
       (err) => {
         r.handlerSettled = true;
         if (r.settled) {
-          this.journal.append({ t: "handler_settled", xact: x });
+          this.#journal.append({ t: "handler_settled", xact: x });
           return;
         }
-        settle("fail");
+        r.settle("fail");
         r.reject(err);
       }
     );
@@ -435,20 +577,19 @@ export class Runtime {
     return { xact: x, promise };
   }
 
-  async invoke(actor, slot, args, opts = {}) {
-    return this.request(actor, slot, args, opts).promise;
+  async invoke(control, slot, args, opts = {}) {
+    return this.request(control, slot, args, opts).promise;
   }
 
-  /** Scheduler tick: settles caller-facing outcomes for expired requests and
-   *  expired queue entries no matter what the handler does afterwards. Hosts
-   *  drive this periodically (or after any clock advance). #9 completion is
-   *  guaranteed by cancel()/tick(), not by handler cooperation. */
+  /** Scheduler tick: settles caller-facing outcomes for expired requests
+   *  and expired queue entries no matter what the handler does afterwards.
+   *  Host-driven; #9 completion is guaranteed by cancel()/tick(), not by
+   *  handler cooperation. Trusted-plane API — a caller-chosen `now` is
+   *  exactly as trusted as the rest of the host surface. */
   tick(now = this.#now()) {
     for (const [x, r] of [...this.#pending]) {
       if (!r.settled && r.deadline !== null && now >= r.deadline) {
-        r.settled = true;
-        this.#pending.delete(x);
-        this.journal.append({ t: "invoke", xact: x, actor: r.actorId, tool: r.tool, outcome: "timeout", argsHash: r.argsHash });
+        r.settle("timeout");
         r.reject(new SubstrateError("E_TIMEOUT", `xact ${x} deadline enforced by tick`));
       }
     }
@@ -458,24 +599,26 @@ export class Runtime {
       if (deadline === null || now < deadline) continue;
       this.#removeQueued(x, q);
       touched.add(q.st);
-      this.journal.append({ t: "expire", xact: x, actor: q.st.token.id });
+      this.#journal.append({ t: "expire", xact: x, actor: q.st.token.id });
       if (q.kind === "waiter") q.waiter.resolve({ ok: false, reason: "expired" });
     }
     for (const st of touched) this.#drain(st);
   }
 
-  /** Cancel by xact id. For requests: the caller is rejected NOW and the
-   *  ledger records delivery cancellation; when a (non-preempted) handler
-   *  eventually settles, a separate `handler_settled` fact is appended —
-   *  cancellation cancels DELIVERY, and the journal never claims otherwise. */
+  /** Cancel by internal xact id (trusted plane). For requests: the caller
+   *  is rejected NOW; when a (non-preempted) handler eventually settles, a
+   *  separate `handler_settled` fact is appended — cancellation cancels
+   *  DELIVERY, and the journal never claims otherwise. */
   cancel(xact) {
     const r = this.#pending.get(xact);
     if (r) {
-      this.journal.append({ t: "cancel", xact });
+      this.#journal.append({ t: "cancel", xact });
       if (!r.settled) {
         r.settled = true;
         this.#pending.delete(xact);
-        this.journal.append({ t: "invoke", xact, actor: r.actorId, tool: r.tool, outcome: "cancelled", argsHash: r.argsHash, delivery: "cancelled" });
+        r.detach?.();
+        const corr = r.correlationId !== null ? { correlationId: r.correlationId } : {};
+        this.#journal.append({ t: "invoke", xact, actor: r.actorId, tool: r.tool, outcome: "cancelled", argsHash: r.argsHash, delivery: "cancelled", ...corr });
         r.reject(new SubstrateError("E_CANCELLED", `xact ${xact} cancelled; result delivery stopped`));
       }
       return true;
@@ -483,7 +626,7 @@ export class Runtime {
     const q = this.#queued.get(xact);
     if (q) {
       this.#removeQueued(xact, q);
-      this.journal.append({ t: "cancel", xact });
+      this.#journal.append({ t: "cancel", xact });
       if (q.kind === "waiter") q.waiter.resolve({ ok: false, reason: "cancelled" });
       this.#drain(q.st);
       return true;
@@ -503,87 +646,83 @@ export class Runtime {
   }
 
   /* ===== mediated messaging =====
-   * tell() requires a capability (right "send") whose target is `to` —
-   * possession of an actor reference is NOT authority to spam it (#3).
-   * Values cross by structured clone both ways; a blocked send NEVER
-   * rejects: it resolves {ok:true} on delivery or {ok:false, reason} on
-   * expiry/cancellation, so ignored results cannot become process-wide
-   * unhandled rejections. */
+   * tell(senderControl, mailboxCap, msg): the DESTINATION is authorized by
+   * the presented capability (target-bound, right "send"); the SENDER is
+   * stamped from its own control handle and cannot be claimed. An ActorId
+   * cannot send, receive, address, or invoke anything. Values cross by
+   * structured clone; a blocked send NEVER rejects: it resolves {ok:true}
+   * on delivery or {ok:false, reason} on expiry/cancellation. */
 
-  tell(from, to, msg, { deadline = null, xact = null } = {}) {
-    if (xact !== null) {
-      if (this.#pending.has(xact) || this.#queued.has(xact)) {
-        this.journal.append({ t: "deliver_denied", xact, from: from?.id ?? null, to: to?.id ?? null, code: "E_INVAL" });
-        throw new SubstrateError("E_INVAL", `xact '${xact}' collides with a live transaction`);
-      }
-    } else {
-      xact = `t${++this.#seq}`;
-      while (this.#queued.has(xact)) xact = `t${++this.#seq}`;
-    }
-    const deny = (code, msg) => {
-      this.journal.append({ t: "deliver_denied", xact, from: from?.id ?? null, to: to?.id ?? null, code });
-      throw new SubstrateError(code, msg);
+  tell(senderControl, mailboxCap, msg, { deadline = null, correlationId = null } = {}) {
+    const tx = this.#x("t");
+    const corr = correlationId !== null ? { correlationId } : {};
+    const deny = (code, msgText) => {
+      this.#journal.append({ t: "deliver_denied", xact: tx, from: senderControl?.id ?? null, code, ...corr });
+      throw new SubstrateError(code, msgText);
     };
-    let fs, ts;
+    let fs;
     try {
-      fs = this.#A(from);
-      ts = this.#A(to);
+      fs = this.#A(senderControl);
     } catch {
-      deny("E_FOREIGN", "actor not owned by this runtime");
+      deny("E_FOREIGN", "sender is not a control handle owned by this runtime");
     }
-    let canSend = false;
-    for (const tok of fs.slots.values()) {
-      const rec = this.#C(tok);
-      if (rec.kind === "actor" && rec.target === to && !rec.revoked && rec.rights.has("send")) {
-        canSend = true;
-        break;
-      }
+    let rec;
+    try {
+      rec = this.#C(mailboxCap);
+    } catch {
+      deny("E_FOREIGN", "destination is not a capability minted by this runtime");
     }
-    if (!canSend) deny("E_RIGHTS", `no send capability for actor ${to.id}`);
+    if (rec.kind !== "actor") deny("E_RIGHTS", "not a mailbox capability");
+    if (rec.revoked) deny("E_REVOKED", "mailbox capability is revoked");
+    if (!rec.rights.has("send")) deny("E_RIGHTS", "capability lacks the 'send' right");
+    const ts = this.#A(rec.target); // target is our own private control token
     let cloned;
     try {
-      cloned = structuredClone(msg);
+      cloned = cloneOrFail(msg);
     } catch {
       deny("E_CANON", "message is not structurally cloneable");
     }
+    const to = ts.token;
     if (ts.waiters.length >= ts.waiterCap) {
-      this.journal.append({ t: "shed", xact, from: from.id, to: to.id, why: "waiters" });
+      this.#journal.append({ t: "shed", xact: tx, from: fs.token.id, to: to.id, why: "waiters", ...corr });
       throw new SubstrateError("E_SHED", `mailbox of '${to.label ?? to.id}' shed (waiter bound)`);
     }
     if (ts.mbox.length >= ts.mboxCap) {
       if (ts.onFull === "block") {
         let w;
         const p = new Promise((resolve) => {
-          w = { sender: from.id, msg: cloned, xact, deadline, resolve };
+          w = { sender: fs.token.id, msg: cloned, xact: tx, deadline, resolve };
         });
         ts.waiters.push(w);
-        this.#queued.set(xact, { st: ts, kind: "waiter", waiter: w });
-        this.journal.append({ t: "tell_blocked", xact, from: from.id, to: to.id });
+        this.#queued.set(tx, { st: ts, kind: "waiter", waiter: w });
+        this.#journal.append({ t: "tell_blocked", xact: tx, from: fs.token.id, to: to.id, ...corr });
         return p;
       }
-      this.journal.append({ t: "shed", xact, from: from.id, to: to.id });
+      this.#journal.append({ t: "shed", xact: tx, from: fs.token.id, to: to.id, ...corr });
       throw new SubstrateError("E_SHED", `mailbox of '${to.label ?? to.id}' is full (${ts.mboxCap})`);
     }
-    ts.mbox.push({ sender: from.id, msg: cloned, xact, deadline });
-    this.#queued.set(xact, { st: ts, kind: "mbox", msg: { xact, deadline } });
-    this.journal.append({ t: "tell", xact, from: from.id, to: to.id });
+    ts.mbox.push({ sender: fs.token.id, msg: cloned, xact: tx, deadline });
+    this.#queued.set(tx, { st: ts, kind: "mbox", msg: { xact: tx, deadline } });
+    this.#journal.append({ t: "tell", xact: tx, from: fs.token.id, to: to.id, ...corr });
     return true;
   }
 
-  recv(actor) {
-    const st = this.#A(actor);
+  /** Reading a mailbox belongs to the control handle alone — self-service,
+   *  not a delegable right (see the rights-algebra note above). */
+  recv(receiverControl) {
+    const st = this.#A(receiverControl);
     let out = null;
     while (st.mbox.length) {
       const m = st.mbox[0];
       if (m.deadline !== null && this.#now() >= m.deadline) {
         st.mbox.shift();
         this.#queued.delete(m.xact);
-        this.journal.append({ t: "expire", xact: m.xact, actor: actor.id });
+        this.#journal.append({ t: "expire", xact: m.xact, actor: st.token.id });
         continue;
       }
       st.mbox.shift();
       this.#queued.delete(m.xact);
-      this.journal.append({ t: "recv", actor: actor.id, sender: m.sender, xact: m.xact });
+      this.#journal.append({ t: "recv", actor: st.token.id, sender: m.sender, xact: m.xact });
       out = { sender: m.sender, msg: m.msg, xact: m.xact };
       break;
     }
@@ -596,13 +735,13 @@ export class Runtime {
       const w = st.waiters.shift();
       this.#queued.delete(w.xact);
       if (w.deadline !== null && this.#now() >= w.deadline) {
-        this.journal.append({ t: "expire", xact: w.xact, actor: st.token.id });
+        this.#journal.append({ t: "expire", xact: w.xact, actor: st.token.id });
         w.resolve({ ok: false, reason: "expired" });
         continue;
       }
       st.mbox.push({ sender: w.sender, msg: w.msg, xact: w.xact, deadline: w.deadline });
       this.#queued.set(w.xact, { st, kind: "mbox", msg: { xact: w.xact, deadline: w.deadline } });
-      this.journal.append({ t: "tell", xact: w.xact, from: w.sender, to: st.token.id, unblocked: true });
+      this.#journal.append({ t: "tell", xact: w.xact, from: w.sender, to: st.token.id, unblocked: true });
       w.resolve({ ok: true });
     }
   }
