@@ -56,28 +56,42 @@ provable against each other. The negative gate is the milestone:
 `complete()` refuses without at least one evidence item backed by a
 journaled `ok` invocation. Acceptance: 13 lifecycle + negative tests.
 
-## S2 — APM as normative spec (spec landed 2026-09-19, `spec/apm.md`)
+## S2 — APM as normative spec (rev. S2.0.1, `spec/apm.md`)
 
 The spec stands on its own, independent of the JavaScript prototype. It
 is built on three separations — **Ownership is not authority. Evidence
 is not correctness. Identity is not execution** — and answers the four
 questions the S1 experiment exposed: the two-graph model (delegation
-graph ⊥ derivation graph, consent as the only lawful bridge; handoff
-proves the split), the intent state machine with a verification state
-(`COMPLETING`) and ledger-replayable transitions, completion as a
-frozen **CompletionContract** of machine-checkable obligations
-(receipt/approval/closure/context) discharged by ledger-backed evidence
-— never a claim about the world — and **attention as a resource**
+graph ⊥ derivation graph; creation only by fresh consent, destruction
+by D-transition revocation; handoff proves the split), the intent state
+machine with a verification state (`COMPLETING`), OPEN-initial waiting
+edges, and replay-unique normalized events (`from/to/stateVersion/
+cause`), completion as a frozen **CompletionContract** of
+machine-checkable obligations (receipt/approval/closure/context)
+**bound at dispatch, never re-labelable at completion** (CO-5) — the
+contract has teeth exactly because past work cannot be renamed to pay
+for promises made after it — and **attention as a resource**
 (AttentionRequest: scope, expiry, consumption, transferability) with
 M2's lease question explicitly deferred until the object is stable.
-Handoff gains an ownership epoch: late receipts count as history,
-never as authorization.
+Handoff gains two independent monotonic counters — `ownerEpoch` and
+`contractRevision` — and a per-intent serial order (ST-4), so late
+receipts count as history, never as authorization, and cannot pay for
+obligations born after the work.
+
+**S2.0.1** (2026-09-19, spec-only): closed the spec-review blockers —
+dispatch-time obligation binding, `contractRevision` beside the epoch —
+and the majors: serial order, the parentage/join-policy split in `D`,
+race losers `CANCELLED(reason=race_lost)` ("cancellation revokes
+future authority, not past effects"), and the Linux-library argument
+demoted to an honest conjunction that Track E must still face.
 
 **S2.1** (next code, order fixed by the spec §8): lifecycle
-privatization, contract + COMPLETING, the closure negative gate first
-(no parent completion over live required children — S1 permits it
-today), join policies (required/optional/race/detached), epoch
-stamping, AttentionRequest. No runtime features ride along.
+privatization + replay-unique events; contract + COMPLETING; the
+closure negative gate first (no parent completion over live required
+children — S1 permits it today); dispatch-time binding stamps; join
+policies over split parentage + supersede/waiver; epoch/revision
+stamping; AttentionRequest. All inside `src/intent.js`. No runtime
+features ride along.
 
 # Track E — enforcement
 
