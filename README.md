@@ -16,8 +16,9 @@ must be enforced). Agate *enforces*; Agamen *defines what should exist*.
 > Status: **M1.6** — v1.6 substrate: authority-handle split (ActorId /
 > ActorControl / MailboxCap), consent-gated slots, clone-or-fail value
 > discipline, private hash-chained ledger, host-plane admit hook; APM
-> state is derived from facts — one private record, one lifecycle writer;
-> 51 invariant + 28 APM tests;
+> state is derived from facts — one fully private record, one lifecycle
+> writer, one owning ledger per intent;
+> 51 invariant + 34 APM tests;
 > Node ≥ 20, dependency-free. M2 (approval leases) stays blocked by
 > design.
 > [Why "Agamen"?](docs/name.md) · [Design thesis](docs/thesis.md) ·
@@ -130,7 +131,7 @@ await sys.complete(intent, [{ xact, obligation: "report_written" }]);
 src/runtime.js                     the substrate (actors/caps/membranes/journal/schedule)
 src/intent.js                      the Agent Process Model (Track S; spec/apm.md)
 test/runtime.test.mjs              invariant suite (51 tests)
-test/intent.test.mjs               APM lifecycle + negative suite (28 tests)
+test/intent.test.mjs               APM lifecycle + negative suite (34 tests)
 bench/run.mjs                      tier 1-2 measurement harness (paired protocol)
 bench/baseline.md                  fitted per-invoke cost model (M1.6 snapshot)
 spec/invariants.md                 normative invariants + threat model + acceptance

@@ -58,7 +58,7 @@ provable against each other. The negative gate is the milestone:
 `complete()` refuses without at least one evidence item backed by a
 journaled `ok` invocation. Acceptance: 13 lifecycle + negative tests.
 
-## S2 — APM as normative spec (rev. S2.0.3, `spec/apm.md`)
+## S2 — APM as normative spec (rev. S2.0.4, `spec/apm.md`)
 
 The spec stands on its own, independent of the JavaScript prototype. It
 is built on three separations — **Ownership is not authority. Evidence
@@ -160,8 +160,48 @@ a convention. 28/28 APM + 51/51 invariant tests. **What this slice
 deliberately does NOT claim:** ST-4 total-order-over-dispatch (still
 spec §8 item 6); the COMPLETING check machinery (item 2 — the frozen
 contract holds, but completion is still the S1 gate plus SELECT-only
-claims, not a §3/§4 verification pass). Next, in spec order: the
-COMPLETING skeleton (ST-1 + four kinds + matcher) → DC-5.
+claims, not a §3/§4 verification pass). **Round-7 correction:** the
+review of this commit judged the [pinned] labels an overclaim — eight
+privatized fields left working bypasses (`intent.approval =
+"not_required"` walked past the approval gate; `children.clear()`
+escaped the revoke cascade; `intent.agent = …` was a handoff with none
+of its three effects), PRIV had no ownership brand (a foreign
+AgentSystem could drive the record while journalling into another
+ledger, voiding replay), and "deep-frozen clones" was shallow spread +
+freeze-through. Architecture approved, pins REVISE — closed by S2.1a
+below.
+
+**S2.1a progress** (2026-09-19, trusted-state closure, round-7
+directives): the four landed items. (1) ST-3 widened to EVERY
+decision-relevant field — relations (agent, parent, children),
+configuration (goal, budget, deadline, approval, context), identity
+(id, openedAt) now share the one private record with the eight state
+fields; `id` is private too, because every check and correlation keys
+on it. (2) The OWNERSHIP BRAND: the record names the AgentSystem that
+minted it, and every system-side access goes through one checked
+accessor (`#R`) — a foreign system is refused `E_FOREIGN` before it can
+mutate anything or write a fact into the wrong ledger; agents are
+branded the same way (`sysA.open(agentOfB)` refused). The foreign-
+system test is now ST-2's central oracle: replay is only meaningful if
+exactly one ledger defines the intent. (3) One snapshot copier —
+structuredClone THEN deep-freeze — replaces the shallow-spread path
+that froze the record's own nested objects through shared references;
+cap tokens remain the declared reference-identity exception. (4)
+Admission-gated activation: OPEN → ACTIVE now follows the first act
+that clears every layer guard AND is an attempt (dispatched call,
+minted grant); guard-refused calls, refused completions, promises
+(amend), approval and ownership moves (handoff) leave OPEN at genesis
+— which also keeps the planned OPEN → WAITING_* edges from racing a
+half-activated state. `runtime.js` untouched again — this whole slice
+asked nothing of Track E, so no new DEP. One deferred gap is recorded,
+not patched (per the review): a failed legacy-path completion can still
+leave candidate evidence in the record; the working-set commit rule is
+part of the COMPLETING skeleton (spec §8 item 2). 34/34 APM + 51/51
+invariant tests; the six new S2.1a tests all fail against the
+immediately-pre-fix `0a002d8` (and the old 28 still pass there — the
+closure changes no behavior the earlier suite legitimately pinned).
+Next, in spec order: the COMPLETING skeleton (ST-1 + four kinds +
+matcher + working-set commit) → DC-5.
 
 # Track E — enforcement
 

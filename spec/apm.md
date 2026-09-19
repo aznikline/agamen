@@ -1,13 +1,18 @@
 # APM — the Agamen Agent Process Model (normative, S2)
 
-> Status: **normative spec, rev. S2.0.3** — it stands on its own;
+> Status: **normative spec, rev. S2.0.4** — it stands on its own;
 > `src/intent.js` (S1) is its first, partial implementation. S2.0.1 closed
 > the spec-review gaps (§8 lists the six pins); S2.0.2 is the round-6
 > honesty patch: CO-5 is defined as a three-phase order (binding
 > precedes HANDLER execution, not every admission/policy side effect),
 > and §7 records DEP-1, the first true S→E cross-track dependency;
-> S2.0.3 syncs labels to the landed ST-3/ST-2 state base (ST-2, ST-3,
-> CO-1 now [pinned]; ST-4 explicitly NOT claimed by it).
+> S2.0.3 synced labels to the landed ST-3/ST-2 state base; S2.0.4 is the
+> round-7 trusted-state closure (S2.1a): ST-3's private set widened to
+> EVERY decision-relevant field plus an owning-AgentSystem brand,
+> snapshots defined as clone-then-freeze, and OPEN activation gated on
+> admitted acts — the S2.0.3 pins overstated what eight privatized
+> fields covered, and this rev states what is now actually true.
+> ST-4 remains explicitly NOT claimed.
 > This file inherits the
 > vocabulary of `spec/invariants.md` and the track definitions of
 > `ROADMAP.md`.
@@ -111,7 +116,7 @@ Terminal: `COMPLETED, FAILED, REVOKED, CANCELLED`.
 
 | from → to | trigger | guard / journal |
 |---|---|---|
-| OPEN → ACTIVE | admission conditions clear at open | `intent_open`; first mediated attempt is charged-attempt [pinned] |
+| OPEN → ACTIVE | the first act that clears every layer guard AND is an attempt (a dispatched call, a minted grant) activates, with that act as the journaled cause; promises (amend), admission facts (approve) and ownership moves (handoff) leave OPEN untouched — a guard-refused attempt changes no lifecycle | `intent_open` genesis; activation edge `intent_state {open→active, cause}`; first mediated attempt is charged-attempt [pinned] |
 | OPEN → WAITING_APPROVAL | admitted with an unresolved required AttentionRequest — no detour through ACTIVE | `attention_open` at open [planned; S1's boolean gate is the degenerate case] |
 | OPEN → WAITING_RESOURCE | admitted with an unmet resource precondition | `waiting_resource` [planned; S1 denies `E_BUDGET` at attempt time] |
 | ACTIVE → SUSPENDED | owner/host suspend | `intent_suspend` [pinned] |
@@ -145,25 +150,47 @@ ST-2  Every state edge is a journaled fact in one normalized shape:
       and activation is an EDGE with a named cause — no silent
       open→active), `illegal edges move nothing and are refusable facts`
       (a rejected transition journals intent_transition_denied and leaves
-      state/version untouched)]
+      state/version untouched), `admission, not ambition, activates
+      OPEN` (S2.1a: calls refused by the envelope/approval/budget/binding
+      guards, and refused completions, leave the intent at genesis v0
+      with no activation edge), `one ledger defines one intent` (S2.1a:
+      a second AgentSystem touching the record is refused E_FOREIGN
+      before it can journal anything — replay is only meaningful if the
+      ledger that brands the record is the only one that writes it)]
 ST-3  Lifecycle state is private to the model layer; principals get
-      read-only views. The private set is at minimum:
-        state, contract, contractRevision, ownerEpoch, envelope,
-        evidence, spent
-      — anything less lets a caller mutate the very things the checks
-      read (a `contract.pop()` erases an obligation with no fact), and
-      "frozen/append-only" remains an API convention, not a property.
-      The write path is singular: exactly one lifecycle writer exists,
-      and the source is checkable for that. [pinned in S2.1: `every
-      determinable field is read-only from the token` (a setter-less view
-      — assignment is a TypeError, and the eight fields live in one
-      module-private record), `snapshots out are frozen` (the arrays a
-      view hands back are frozen deep clones; mutating them cannot reach
-      the record — this is what finally makes "contract.pop() is futile"
-      a property, and it is what gates CO-1's [pinned]), `the source
-      itself proves a single lifecycle writer` (a test scans the
-      implementation for state/version assignments outside the one
-      transition primitive)]
+      read-only views. The private set is EVERY field a check, gate or
+      cascade reads:
+        relations      agent, parent, children
+        configuration  goal, budget, deadline, approval, context
+        determinable   state, stateVersion, contract, contractRevision,
+        state          ownerEpoch, envelope, evidence, spent
+        identity       id, openedAt
+      plus the OWNERSHIP BRAND: the record names the AgentSystem that
+      minted it, and only that system may reach it — PRIV reachability
+      without the brand lets a second system drive the same record while
+      journalling into a different ledger, which would make ST-2's
+      replay claim false for the ledger that actually owns the intent.
+      Anything less lets a caller mutate the very things the checks
+      read (`approval = "not_required"` walks past the approval gate,
+      `budget = null` walks past charging, `children.clear()` escapes
+      the revoke cascade, `agent = …` is a handoff with no envelope
+      kill, no epoch++, no fact), and "frozen/append-only" remains an
+      API convention, not a property. Views out are TRUE snapshots:
+      structuredClone THEN deep-freeze — freeze-only paths freeze the
+      record's own nested objects through shared references, which is
+      unwritable but not a snapshot. Capability tokens are the declared
+      exception: opaque handles keep reference identity. The write path
+      is singular: exactly one lifecycle writer exists, and the source
+      is checkable for that. [pinned in S2.1a: `every determinable
+      field is read-only from the token`, `relations and configuration
+      are decision-relevant too` (assignment to any of agent/parent/
+      children/goal/budget/deadline/approval/context/id/openedAt is a
+      TypeError, and the approval gate the tamper aimed at still gates),
+      `the revoke cascade walks the PRIVATE children set`, ``intent.agent
+      = …` is not a handoff`, `snapshots out are frozen`, `views are
+      TRUE snapshots` (nested references differ per read — clone, not
+      freeze-through), `the source itself proves a single lifecycle
+      writer`]
 ST-4  Intent transition serial order: effect dispatch, handoff, revoke
       (including each cascade leg), approval consumption,
       amend/supersede, and every lifecycle edge on one intent are
@@ -460,6 +487,22 @@ no new rules: ST-2, ST-3 and (consequently) CO-1 move from
 planned/partial to [pinned] with their test names; §8 item 1 is struck.
 ST-4 gains nothing from this slice and says so.
 
+**S2.0.4 (round-7 trusted-state closure, landed 2026-09-19 — code slice
+S2.1a)** — the review of 0a002d8 found S2.0.3's pins overstated:
+privatizing eight fields while `approval/budget/deadline/goal/agent/
+parent/children` stayed public left working bypasses (the approval gate,
+the budget gate, the revoke cascade, a fake in-place handoff), and the
+module-wide PRIV had no ownership brand (a foreign AgentSystem could
+drive an intent's state and journal into the wrong ledger, voiding
+replay). Landed with this rev: full-field privatization + brand +
+`#R` single checked accessor; clone-then-freeze snapshots (replacing
+shallow-spread + freezeDeep, which froze the record's own nested
+objects); and admission-gated OPEN activation. The round-7 review also
+recorded a DEFERRED gap rather than a quick patch: a FAILED completion
+on the legacy (empty-contract) path may still leave candidate evidence
+in the record — the working-set commit rule lands with the COMPLETING
+skeleton (item 2); the contract branch already follows it.
+
 **S2.1 (next code, in this order — reordered after round-5 review so no
 check ever runs against mutable truth)**
 
@@ -473,6 +516,10 @@ check ever runs against mutable truth)**
 2. the COMPLETING skeleton complete: ST-1 entry-as-check, all four
    obligation kinds, matcher semantics (CO-2…4) — what remains here is
    the CHECK machinery, the frozen-contract property already holds;
+   plus the WORKING-SET COMMIT RULE for candidate evidence (claims are
+   verified against a temporary set; `rec.evidence` changes only at
+   COMPLETING → COMPLETED; denials mutate no truth — closes the
+   round-7 deferred gap on the legacy path);
 3. closure negative gate first, as a test before the feature (DC-5);
 4. ~~dispatch-time binding~~ LANDED (CO-5 pinned by the temporal test;
    written in the substrate's admit hook, refusing matcher included);

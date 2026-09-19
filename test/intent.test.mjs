@@ -480,3 +480,105 @@ test("ST-2: the source itself proves a single lifecycle writer", () => {
       "an assignment to state/stateVersion escaped #transition — there would be a second lifecycle writer");
   }
 });
+
+/* ---------- S2.1a: the trusted-state closure (round-7 blockers) ---------- */
+
+test("ST-3: relations and configuration are decision-relevant too — every one is a read-only view", async () => {
+  const { sys, intent, slot } = harness({ budget: { calls: 5 }, approval: "required" });
+  assert.throws(() => { intent.approval = "not_required"; }, TypeError); // the round-7 gate bypass, dead
+  assert.throws(() => { intent.budget = null; }, TypeError);
+  assert.throws(() => { intent.deadline = null; }, TypeError);
+  assert.throws(() => { intent.goal = { outcome: "mine now" }; }, TypeError);
+  assert.throws(() => { intent.parent = null; }, TypeError);
+  assert.throws(() => { intent.context = null; }, TypeError);
+  assert.throws(() => { intent.children = []; }, TypeError);
+  assert.throws(() => { intent.id = "i0-forged"; }, TypeError); // every check keys on id
+  assert.throws(() => { intent.openedAt = "1970-01-01"; }, TypeError);
+  // and the gate the tamper aimed at still gates:
+  assert.equal(await asyncCode(sys.call(intent, slot, {})), "E_APPROVAL");
+});
+
+test("ST-3: the revoke cascade walks the PRIVATE children set — no view-edit dodges it", async () => {
+  const { sys, intent, slot } = harness();
+  await sys.call(intent, slot, { job: 1 });
+  const child = sys.fork(intent);
+  assert.throws(() => intent.children.clear(), TypeError); // pre-fix: children was a public Set; clear() "won"
+  assert.throws(() => intent.children.push("i9999-ghost"), TypeError);
+  sys.revoke(intent);
+  assert.equal(child.state, "revoked"); // the cascade never consulted a mutable view
+});
+
+test("ST-3: `intent.agent = …` is not a handoff — it is a TypeError, and the three handoff effects stay owned", () => {
+  const { rt, sys, agent, intent } = harness();
+  const squatter = sys.register("squatter");
+  assert.throws(() => { intent.agent = squatter; }, TypeError);
+  assert.equal(intent.agent, agent); // would-be silent takeover moved nothing…
+  assert.equal(intent.ownerEpoch, 1); // …no epoch bump…
+  assert.equal(evs(rt, "intent_handoff").length, 0); // …and no ledger fact. Handoff is the ONLY move.
+});
+
+test("ST-2/ST-3: one ledger defines one intent — a foreign AgentSystem is refused before it writes anywhere", async () => {
+  const rtA = new Runtime();
+  const sysA = new AgentSystem(rtA);
+  const a = sysA.register("a");
+  const intent = sysA.open(a, { goal: { outcome: "guarded" } }); // rtA ledger: OPEN v0
+  const rtB = new Runtime();
+  const sysB = new AgentSystem(rtB);
+  const b = sysB.register("b");
+  // the reviewer's construction: sysB.fail drives the SAME record but journals elsewhere
+  assert.throws(() => sysB.fail(intent, "cross-ledger"), (e) => e.code === "E_FOREIGN");
+  assert.throws(() => sysB.amend(intent, ["late-promise"]), (e) => e.code === "E_FOREIGN");
+  assert.throws(() => sysB.handoff(intent, b), (e) => e.code === "E_FOREIGN");
+  assert.throws(() => sysB.revoke(intent), (e) => e.code === "E_FOREIGN");
+  assert.throws(() => sysA.open(b, { goal: { outcome: "poached" } }), (e) => e.code === "E_FOREIGN"); // agents branded too
+  assert.equal(await asyncCode(sysB.call(intent, "any-slot", {})), "E_FOREIGN");
+  // nothing moved in truth or in either ledger:
+  assert.equal(intent.state, "open");
+  assert.equal(intent.stateVersion, 0);
+  assert.equal(evs(rtB, "intent_state").length, 0); // no edge in the WRONG ledger…
+  assert.equal(evs(rtB, "intent_transition_denied").length, 0); // …not even a denial — refused before any fact
+  assert.equal(evs(rtA, "intent_state").filter((e) => e.intent === intent.id).length, 1); // genesis only
+  assert.equal(sysA.handoff(intent, a) && intent.ownerEpoch, 2); // the RIGHT system still owns the move
+});
+
+test("ST-3: views are TRUE snapshots — clone-then-freeze, no shared reference through the getter", async () => {
+  const rt = new Runtime();
+  const sys = new AgentSystem(rt);
+  const { server } = rt.serve("svc", "t", async (p) => ({ receipt: `did:${p.job ?? "?"}` }));
+  const a = sys.register("s");
+  const intent = sys.open(a, { goal: { outcome: "g", detail: { list: [1, 2] } } });
+  assert.notEqual(intent.goal, intent.goal); // each read is its own clone…
+  assert.notEqual(intent.goal.detail, intent.goal.detail); // …DEEP, not a shallow spread…
+  // (frozen arrays cloned in the module realm throw THAT realm's TypeError —
+  // cross-realm instanceof fails, so match by name, not constructor)
+  const isTE = (e) => e.name === "TypeError";
+  assert.throws(() => intent.goal.detail.list.push(3), isTE); // …and frozen on the way out
+  const slot = sys.grantFor(intent, server, "t");
+  const { xact } = await sys.call(intent, slot, { job: 1 });
+  await sys.complete(intent, [{ xact, meta: { nested: [7] } }]);
+  assert.notEqual(intent.evidence[0].meta, intent.evidence[0].meta); // pre-fix: same reference both reads (freeze-through)
+  assert.throws(() => intent.evidence[0].meta.nested.push(8), isTE);
+});
+
+test("ST-2: admission, not ambition, activates OPEN — guard-refused attempts change no lifecycle", async () => {
+  const rt = new Runtime();
+  const sys = new AgentSystem(rt);
+  const { server } = rt.serve("svc", "t", async () => 1);
+  const a = sys.register("q");
+  const intent = sys.open(a, { goal: { outcome: "x" }, approval: "required", contract: ["pilot"] });
+  // every local guard refuses while the intent is still OPEN…
+  assert.equal(await asyncCode(sys.call(intent, "slot-never-granted", {})), "E_NO_CAP");
+  assert.equal(intent.state, "open");
+  assert.equal(intent.stateVersion, 0);
+  assert.equal(await asyncCode(sys.complete(intent, [])), "E_NO_EVIDENCE"); // unmet contract, no dispatch
+  assert.equal(intent.state, "open"); // pre-fix: the failed call had already burned the genesis edge
+  // a promise is not an attempt either: amending leaves OPEN untouched
+  sys.amend(intent, ["second"]);
+  assert.equal(intent.state, "open");
+  assert.equal(evs(rt, "intent_state").filter((e) => e.intent === intent.id).length, 1); // genesis only
+  // the admitted act activates, with its named cause
+  sys.grantFor(intent, server, "t");
+  const e = evs(rt, "intent_state").at(-1);
+  assert.deepEqual({ from: e.fromState, to: e.toState, v: e.stateVersion, cause: e.cause }, { from: "open", to: "active", v: 1, cause: "grant" });
+  assert.equal(await asyncCode(sys.call(intent, `intent:${intent.id}:t`, {})), "E_APPROVAL"); // gate intact on the now-ACTIVE intent
+});
