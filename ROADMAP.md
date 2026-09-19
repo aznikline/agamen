@@ -58,7 +58,7 @@ provable against each other. The negative gate is the milestone:
 `complete()` refuses without at least one evidence item backed by a
 journaled `ok` invocation. Acceptance: 13 lifecycle + negative tests.
 
-## S2 — APM as normative spec (rev. S2.0.5, `spec/apm.md`)
+## S2 — APM as normative spec (rev. S2.0.6, `spec/apm.md`)
 
 The spec stands on its own, independent of the JavaScript prototype. It
 is built on three separations — **Ownership is not authority. Evidence
@@ -240,6 +240,44 @@ adapted to the new `hasIntent`/`mutateContext` API, not behavior
 regressions). With this the trusted-state base is closed — per the
 review, closure work STOPS here; next, in spec order: the COMPLETING
 skeleton (ST-1 + four kinds + matcher + working-set commit) → DC-5.
+
+**S2.1c progress** (2026-09-19, ingress ownership closure, round-9
+directives): the review of `f754eba` signed the AgentPrincipal closure,
+the context-write closure and ST-2, but found the boundary still
+one-directional — S2.1b stopped mutable references leaking OUT; nothing
+stopped caller-owned references leaking IN. Two concrete wounds:
+`register` stored the caller's `model`/`label` BY REFERENCE (mutating
+the original object after the call rewrote the private record with no
+rebind act, no fact, no getter needed), and facts passed input
+references into `rt.record()`, which does not clone — so mutating an
+input after `open` changed event content AFTER it had been hashed, and
+`verifyJournal()` went false: a token holder editing authoritative
+history. Landed: ingress clone-normalization (goal/budget/approval/
+context/obligations deep-copied into records at the door); `#fact`
+deep-owns every event before the ledger (per-value clone; a
+non-cloneable payload degrades to String, never to a live alias);
+`agent_register` rides `#fact` like every other fact; `intent_open` is
+composed from the PRIVATE record, not the parameter references;
+label/model/deadline narrowed to immutable identity forms (string /
+null|string / null|finite number — a structured ModelBinding is §8
+work, not a silent object alias). Principle recorded in spec ST-3:
+**authoritative-state isolation is bidirectional — no mutable aliases
+out, no caller-owned aliases in; the outward reachable graph (round 8)
+and the inward aliasing graph (round 9) together are the ownership
+boundary.** The round-9 MAJORs are deferred by directive into the
+COMPLETING pre-works (spec §8 item 2): immutable per-version
+ContextVersion VALUES (today's view is a read-only live cursor —
+evidence must bind a snapshot, not a moving lens) and the plain-data
+snapshot domain (freezeDeep over Map/Set/Date is false immutability,
+which would poison the `Object.isFrozen` oracle). `runtime.js`
+untouched (zero diff); CO-5's admit-hook shape unchanged; ST-4 not
+claimed. 42/42 APM + 51/51 invariant tests; the four new ingress
+oracles all fail against pre-fix `f754eba` — the flagship on the
+reviewer's own attack (post-open goal tamper ⇒ 'rewritten-after-hash'
+inside a hashed event), and all 38 older tests pass unchanged on
+pre-fix (no API adaptations this round, unlike S2.1b). Next, in spec
+order and with the §8 item 2 pre-works first inside it: the COMPLETING
+skeleton → DC-5.
 
 # Track E — enforcement
 

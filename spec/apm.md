@@ -1,6 +1,6 @@
 # APM — the Agamen Agent Process Model (normative, S2)
 
-> Status: **normative spec, rev. S2.0.5** — it stands on its own;
+> Status: **normative spec, rev. S2.0.6** — it stands on its own;
 > `src/intent.js` (S1) is its first, partial implementation. S2.0.1 closed
 > the spec-review gaps (§8 lists the six pins); S2.0.2 is the round-6
 > honesty patch: CO-5 is defined as a three-phase order (binding
@@ -14,7 +14,11 @@
 > (S2.1b): ST-3's boundary made TRANSITIVE over the reachable object
 > graph — `intent.agent` is an inert AgentPrincipal view, context is a
 > ContextVersion stream behind owned mutation acts, and no holder-side
-> reference path reaches a mutable authority-bearing object.
+> reference path reaches a mutable authority-bearing object; S2.0.6 is
+> the round-9 ingress ownership closure (S2.1c): the boundary made
+> BIDIRECTIONAL — no mutable aliases out AND no caller-owned aliases in
+> (inputs clone-ingress into private records; every fact is deep-owned
+> before the ledger, which does not clone events).
 > ST-4 remains explicitly NOT claimed.
 > This file inherits the
 > vocabulary of `spec/invariants.md` and the track definitions of
@@ -197,7 +201,18 @@ ST-3  Lifecycle state is private to the model layer; principals get
       (Intent, AgentPrincipal, ContextView) is frozen at construction,
       so no property can be bolted onto it, and no two-hop reference
       path from a token reaches a mutable authority-bearing object.
-      [pinned in S2.1a + S2.1b: `every determinable
+      And the boundary is BIDIRECTIONAL (S2.1c): no mutable aliases
+      out, no caller-owned aliases IN. Authoritative state and ledger
+      events hold APM-owned values, never input references: ingress
+      clones (goal/budget/approval/context/obligations are deep-copied
+      into the record at the door), facts are deep-owned before
+      `record` (provenance does not clone events, so an aliased event
+      content could be rewritten AFTER hashing — that edits history,
+      not just state), and identity-ish inputs are narrowed to
+      immutable forms: label is a string, model is null | string
+      (a structured ModelBinding gets its own object when it lands),
+      deadline is null | finite number. [pinned in S2.1a + S2.1b +
+      S2.1c: `every determinable
       field is read-only from the token`, `relations and configuration
       are decision-relevant too` (assignment to any of agent/parent/
       children/goal/budget/deadline/approval/context/id/openedAt is a
@@ -211,7 +226,13 @@ ST-3  Lifecycle state is private to the model layer; principals get
       or the Runtime), `the agent brand is itself unforgeable` (the
       attack lands on `.sys`/`.control` themselves, not just on a
       foreign object), `context is a ContextVersion stream`,
-      `transitive read-only walk`]
+      `transitive read-only walk`, `S2.1c ingress: register owns its
+      inputs`, `S2.1c ingress: mutating the caller's goal after open
+      cannot rewrite hashed history` (the flagship: verifyJournal()
+      survives tampering with the input graph), `S2.1c ingress: even a
+      DENIED claim's object cannot stay aliased inside the ledger`,
+      `S2.1c ingress: approval scopes and model rebinds are owned
+      values`]
 ST-4  Intent transition serial order: effect dispatch, handoff, revoke
       (including each cascade leg), approval consumption,
       amend/supersede, and every lifecycle edge on one intent are
@@ -545,6 +566,33 @@ declared fields. The substrate is untouched, CO-5's binding shape is
 unchanged, and ST-4 is still not claimed. This closes the trusted-state
 work — the next code slice is the COMPLETING skeleton (item 2).
 
+**S2.0.6 (round-9 ingress ownership closure, landed 2026-09-19 — code
+slice S2.1c)** — the review of f754eba approved the AgentPrincipal and
+context-write closures but found the third edge of the boundary open:
+S2.1b sealed mutable references from leaking OUT; nothing stopped
+caller-owned references from leaking IN. `register` stored the caller's
+`model`/`label` objects by reference (so `agent.model.cfg.mode = …`
+mutated the private record with no rebind act — and the caller needed
+no getter: mutating the original object after `register`/`open` hit the
+record directly), and facts passed input references into `rt.record()`,
+which does not clone: mutating the input graph after `open` rewrote
+event content AFTER it had been hashed, breaking `verifyJournal()` —
+a token holder editing authoritative history. Landed: ingress
+clone-normalization into every record; `#fact` deep-owns each event
+before the ledger (non-cloneable payloads degrade to String, never to a
+live alias); `agent_register` routed through `#fact`; `intent_open`
+composed from the private record; label/model/deadline narrowed to
+immutable identity (string / null|string / null|finite number —
+structured forms are §8 work, not silent aliases). The recorded
+principle: AUTHORITATIVE-STATE ISOLATION IS BIDIRECTIONAL — no mutable
+aliases out, no caller-owned aliases in; round 8 closed the outward
+reachable graph, this closes the inward aliasing graph, and only the
+two together make an ownership boundary. The round-9 MAJORs (live
+ContextView vs immutable ContextVersion values; freezeDeep's false
+immutability over Map/Set) are recorded as COMPLETING pre-works in
+item 2 — the `context` obligation must not land on either shortcut.
+Still: substrate untouched, CO-5 shape unchanged, ST-4 unclaimed.
+
 **S2.1 (next code, in this order — reordered after round-5 review so no
 check ever runs against mutable truth)**
 
@@ -561,7 +609,16 @@ check ever runs against mutable truth)**
    plus the WORKING-SET COMMIT RULE for candidate evidence (claims are
    verified against a temporary set; `rec.evidence` changes only at
    COMPLETING → COMPLETED; denials mutate no truth — closes the
-   round-7 deferred gap on the legacy path);
+   round-7 deferred gap on the legacy path); plus the ROUND-9
+   PRE-WORKS, required because the `context` obligation reads them:
+   (a) an immutable per-version ContextVersion VALUE — today's
+   ContextView is a read-only LIVE cursor (version/snapshot track the
+   head), so completion evidence must bind a detached
+   `{version, snapshot, lineage-ref}` value, not a moving view;
+   (b) the PLAIN-DATA SNAPSHOT DOMAIN — Map/Set/Date/class instances
+   are structured-cloneable but freezeDeep gives them no immutable
+   semantics, which poisons any `Object.isFrozen` oracle; refuse them
+   at the door instead of inventing immutable wrappers;
 3. closure negative gate first, as a test before the feature (DC-5);
 4. ~~dispatch-time binding~~ LANDED (CO-5 pinned by the temporal test;
    written in the substrate's admit hook, refusing matcher included);

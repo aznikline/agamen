@@ -662,3 +662,75 @@ test("ST-3: transitive read-only walk — every reachable value is a frozen snap
   // caps are the DECLARED exception — opaque handles, not data:
   assert.ok(intent.envelope[0].cap);
 });
+
+/* ---------- S2.1c: ingress ownership (round-9 blocker) ----------
+ * The boundary is bidirectional: no mutable aliases OUT (S2.1b), no
+ * caller-owned aliases IN. Provenance does not clone events — an input
+ * reference that reaches rt.record() keeps the CALLER holding live
+ * content inside already-hashed history. */
+
+test("S2.1c ingress: register owns its inputs — label/model are immutable identity, context clones at the door", () => {
+  const rt = new Runtime();
+  const sys = new AgentSystem(rt);
+  // pre-fix: the object passed straight into the record AND the fact —
+  // `agent.model.cfg.mode = "evil"` then mutated private truth with no
+  // agent_rebind act at all
+  assert.throws(() => sys.register("a", { model: { name: "m", cfg: { mode: "safe" } } }), (e) => e.code === "E_INVAL");
+  assert.throws(() => sys.register(42), (e) => e.code === "E_INVAL");
+  const ctx = { facts: ["v1"] };
+  const a = sys.register("a", { model: "m-alpha", context: ctx });
+  ctx.facts.push("injected"); // the caller still holds the original…
+  assert.deepEqual(a.context.snapshot(), { facts: ["v1"] }); // …but the record got a clone
+  assert.equal(evs(rt, "agent_register").at(-1).model, "m-alpha");
+  assert.equal(rt.verifyJournal(), true);
+});
+
+test("S2.1c ingress: mutating the caller's goal after open cannot rewrite hashed history", async () => {
+  const rt = new Runtime();
+  const sys = new AgentSystem(rt);
+  const { server } = rt.serve("svc", "t", async () => 1);
+  const a = sys.register("a");
+  const goal = { task: { name: "original" } };
+  const budget = { calls: 1 };
+  const intent = sys.open(a, { goal, budget });
+  // the reviewer's attack, verbatim in shape:
+  goal.task.name = "rewritten-after-hash";
+  budget.calls = 999;
+  // pre-fix, the intent_open event's `goal` WAS this object — the hash
+  // covers "original" while the event now reads "rewritten":
+  assert.equal(evs(rt, "intent_open").at(-1).goal.task.name, "original");
+  assert.equal(rt.verifyJournal(), true);
+  assert.equal(intent.goal.task.name, "original"); // views read the record's clone
+  assert.deepEqual(intent.budget, { calls: 1 }); // the gate reads the clone too
+  const slot = sys.grantFor(intent, server, "t");
+  await sys.call(intent, slot, {});
+  assert.equal(await asyncCode(sys.call(intent, slot, {})), "E_BUDGET"); // 999 bought nothing
+});
+
+test("S2.1c ingress: even a DENIED claim's object cannot stay aliased inside the ledger", async () => {
+  const { rt, sys, intent, slot } = contractHarness(["flight"]);
+  await sys.call(intent, slot, { job: 1 }, { for: ["flight"] });
+  const claim = { xact: "x999-forged", obligation: "flight", meta: { note: "original" } };
+  assert.equal(await asyncCode(sys.complete(intent, [claim])), "E_NO_EVIDENCE");
+  claim.meta.note = "rewritten-after-hash"; // pre-fix: the refusal fact held THIS object
+  const d = evs(rt, "completion_denied").at(-1);
+  assert.equal(d.claim.meta.note, "original");
+  assert.equal(rt.verifyJournal(), true);
+});
+
+test("S2.1c ingress: approval scopes and model rebinds are owned values, not live references", () => {
+  const rt = new Runtime();
+  const sys = new AgentSystem(rt);
+  const { server } = rt.serve("svc", "t", async () => 1);
+  const a = sys.register("a", { model: "m1" });
+  const intent = sys.open(a, { goal: { o: 1 }, approval: "required" });
+  sys.grantFor(intent, server, "t"); // grant activates; approval still gates calls
+  const scope = { window: { max: 1 } };
+  sys.approve(intent, scope);
+  scope.window.max = 99; // pre-fix this only reached a clone — kept as a pinned expectation, not a teeth claim
+  assert.equal(evs(rt, "intent_approve").at(-1).scope.window.max, 1);
+  sys.suspend(intent);
+  assert.throws(() => sys.resume(intent, { model: { evil: true } }), (e) => e.code === "E_INVAL"); // pre-fix: aliased into the record, fact unhashed-able
+  assert.equal(a.model, "m1"); // the refusal rebound nothing
+  assert.equal(rt.verifyJournal(), true);
+});

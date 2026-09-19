@@ -15,7 +15,13 @@
  * ContextVersions behind a read-only view, and belief mutation is an
  * AgentSystem act that journals `context_version {fromVersion,
  * toVersion, cause}` — Identity is not execution, applied to the API
- * surface itself.
+ * surface itself. S2.1c closes the other half of the boundary:
+ * authoritative-state isolation is BIDIRECTIONAL — no mutable aliases
+ * out (S2.1b), no caller-owned aliases in. Every external value is
+ * clone-normalized before it enters a private record, and every fact is
+ * deep-owned before it reaches the ledger (Provenance does not clone,
+ * and an aliased event content could be rewritten after hashing);
+ * label/model/deadline are narrowed to immutable identity at the door.
  *
  * The private record of an Intent holds EVERY decision-relevant field —
  * relations (agent, parent, children), configuration (goal, budget,
@@ -155,6 +161,25 @@ function snapshot(v) {
   }
 }
 
+/* INGRESS ownership (S2.1c, round-9 BLOCKER): the egress boundary says
+ * no mutable alias LEAVES; this one says no caller-owned alias ENTERS
+ * authoritative state or the ledger. Provenance does not clone events,
+ * so handing rt.record() a caller reference keeps that reference inside
+ * an already-hashed event — mutate through it afterwards and you have
+ * rewritten the history verifyJournal() reads. Every fact is deep-copied
+ * per value on its way in; a non-cloneable payload (a denial claim
+ * carrying a function) degrades to its String form, never to a live
+ * reference. Record-side ingress uses the strict copiers (cloneContext /
+ * structuredClone or E_INVAL/E_CANON), never this lossy fallback. */
+function ownValue(v) {
+  if (v === null || typeof v !== "object") return v;
+  try {
+    return structuredClone(v);
+  } catch {
+    return String(v);
+  }
+}
+
 class ContextHead {
   data;
   version = 0;
@@ -256,6 +281,12 @@ const LEGAL_EDGES = {
 export class Intent {
   #id;
   constructor({ system, agent, parent = null, goal, budget = null, deadline = null, approval = "not_required", contextSeed = {}, contract = [] }) {
+    // Ingress (S2.1c): a Date is cloneable but not comparable truth the
+    // substrate can enforce — deadline must be numeric or absent, so no
+    // caller-retained mutable object ever sits in the gate's path.
+    if (deadline !== null && !Number.isFinite(deadline)) {
+      throw new SubstrateError("E_INVAL", "deadline must be null or a finite absolute ms time");
+    }
     this.#id = `i${nextIntent++}`;
     PRIV.set(this, {
       system, // ST-3 ownership boundary: exactly one AgentSystem defines this record
@@ -265,7 +296,7 @@ export class Intent {
       goal: cloneContext(goal), // the requested outcome, plain data
       budget: budget === null ? null : cloneContext(budget), // {calls} charged per mediated attempt
       deadline, // absolute ms, enforced by the substrate at request time
-      approval, // "not_required" | "required" | { approved, at }
+      approval: typeof approval === "string" ? approval : cloneContext(approval), // "not_required" | "required" | { approved, at }
       context: new ContextHead(contextSeed, this.#id),
       openedAt: nowIso(),
       // state null / version -1 until the OPEN genesis edge lands them at
@@ -343,6 +374,17 @@ export class AgentSystem {
 
   register(label, opts = {}) {
     const { model = null, context = {} } = opts;
+    // Ingress narrowing (S2.1c): label and model are immutable identity,
+    // not caller-aliased objects. A structured model binding gets its own
+    // spec object when it lands (ModelBinding, §8) — an object smuggled in
+    // here would be a mutable alias into the private record AND the
+    // agent_register fact, updatable after hashing with no rebind act.
+    if (typeof label !== "string" || label === "") {
+      throw new SubstrateError("E_INVAL", "label must be a non-empty string");
+    }
+    if (model !== null && typeof model !== "string") {
+      throw new SubstrateError("E_INVAL", "model must be null | string — a mutable model object would alias into the private record; ModelBinding lands with spec §8");
+    }
     const rec = {
       system: this,
       id: `agent${nextAgent++}`,
@@ -355,7 +397,7 @@ export class AgentSystem {
     const principal = new AgentPrincipal(rec);
     rec.principal = principal;
     AGENT_PRIV.set(principal, rec);
-    this.rt.record({ t: "agent_register", agent: rec.id, label, model });
+    this.#fact({ t: "agent_register", agent: rec.id, label, model });
     this.agents.set(rec.id, principal);
     return principal;
   }
@@ -365,9 +407,13 @@ export class AgentSystem {
     if (!goal || typeof goal !== "object") throw new SubstrateError("E_INVAL", "goal must describe the requested outcome");
     const intent = new Intent({ system: this, agent, goal, budget, deadline, approval, contextSeed: context, contract });
     this.#track(arec, intent);
+    // The fact describes what the RECORD holds (clone-ingressed), never
+    // the caller's parameter references (S2.1c): even if #fact's defensive
+    // clone were removed, no journal event could alias the input graph.
     const rec = this.#R(intent);
     this.#fact({
-      t: "intent_open", intent: intent.id, agent: arec.id, goal, budget, deadline, approval,
+      t: "intent_open", intent: intent.id, agent: arec.id,
+      goal: rec.goal, budget: rec.budget, deadline: rec.deadline, approval: rec.approval,
       contract: rec.contract.map((o) => o.id),
     });
     this.#transition(intent, "open", "open"); // genesis rides the same primitive — no special case
@@ -498,6 +544,9 @@ export class AgentSystem {
   resume(intent, { model = null } = {}) {
     const rec = this.#R(intent);
     this.#requireState(rec, "suspended"); // trigger guard: only a park may resume
+    if (model !== null && typeof model !== "string") {
+      throw new SubstrateError("E_INVAL", "model must be null | string (see register)");
+    }
     const arec = AGENT_PRIV.get(rec.agent);
     if (model !== null && model !== arec.model) {
       const prev = arec.model;
@@ -790,7 +839,13 @@ export class AgentSystem {
   }
 
   #fact(ev) {
-    this.rt.record({ ...ev, at: nowIso() });
+    // S2.1c: the ledger boundary. Provenance.append does NOT clone, and
+    // the event's content is hashed as it stands — so a caller-owned (or
+    // record-owned) reference passed straight through would leave a live
+    // alias inside already-hashed history. Own every value on the way in.
+    const owned = {};
+    for (const k of Object.keys(ev)) owned[k] = ownValue(ev[k]);
+    this.rt.record({ ...owned, at: nowIso() });
   }
 
   /* The one lifecycle writer (ST-2). An edge is read, validated,
