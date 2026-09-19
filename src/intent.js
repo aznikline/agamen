@@ -22,6 +22,14 @@
  * deep-owned before it reaches the ledger (Provenance does not clone,
  * and an aliased event content could be rewritten after hashing);
  * label/model/deadline are narrowed to immutable identity at the door.
+ * S2.1d froze the last JS-specific edge of the graph: the BEHAVIOR
+ * surface. The prototypes of the three view classes are frozen — a
+ * configurable getter on a mutable prototype is a writable door no
+ * matter how well the instance is fenced — and authoritative identity
+ * (intent id, principal id) is record data: internal code resolves
+ * ids through PRIV/AGENT_PRIV and never through a presentation getter,
+ * so even a hypothetical getter rewrite could not misattribute a
+ * single ledger fact.
  *
  * The private record of an Intent holds EVERY decision-relevant field —
  * relations (agent, parent, children), configuration (goal, budget,
@@ -279,7 +287,6 @@ const LEGAL_EDGES = {
 };
 
 export class Intent {
-  #id;
   constructor({ system, agent, parent = null, goal, budget = null, deadline = null, approval = "not_required", contextSeed = {}, contract = [] }) {
     // Ingress (S2.1c): a Date is cloneable but not comparable truth the
     // substrate can enforce — deadline must be numeric or absent, so no
@@ -287,8 +294,12 @@ export class Intent {
     if (deadline !== null && !Number.isFinite(deadline)) {
       throw new SubstrateError("E_INVAL", "deadline must be null or a finite absolute ms time");
     }
-    this.#id = `i${nextIntent++}`;
+    const id = `i${nextIntent++}`;
     PRIV.set(this, {
+      id, // S2.1d: identity is RECORD data. Internally the id is only
+          // ever read from records — a getter on a prototype, however
+          // honest today, is a behavior surface (see the prototype
+          // freeze below); the public getter is presentation only.
       system, // ST-3 ownership boundary: exactly one AgentSystem defines this record
       agent, // AgentPrincipal currently holding the envelope
       parent,
@@ -297,7 +308,7 @@ export class Intent {
       budget: budget === null ? null : cloneContext(budget), // {calls} charged per mediated attempt
       deadline, // absolute ms, enforced by the substrate at request time
       approval: typeof approval === "string" ? approval : cloneContext(approval), // "not_required" | "required" | { approved, at }
-      context: new ContextHead(contextSeed, this.#id),
+      context: new ContextHead(contextSeed, id),
       openedAt: nowIso(),
       // state null / version -1 until the OPEN genesis edge lands them at
       // open / 0 through the same primitive as every other edge (ST-2)
@@ -313,7 +324,7 @@ export class Intent {
     Object.freeze(this); // the token itself accepts no own properties
   }
 
-  get id() { return this.#id; }
+  get id() { return PRIV.get(this).id; }
   get agent() { return PRIV.get(this).agent; } // AgentPrincipal VIEW — identity only, never control/sys
   get parent() { return PRIV.get(this).parent; } // another read-only token
   get children() { return Object.freeze([...PRIV.get(this).children]); }
@@ -334,6 +345,22 @@ export class Intent {
   }
   get evidence() { return Object.freeze(PRIV.get(this).evidence.map((ev) => snapshot(ev))); }
 }
+
+/* ---------- the boundary's behavior surface: frozen prototypes (S2.1d) ----------
+ * A frozen INSTANCE with a mutable prototype is a frozen door in an
+ * unpainted wall: class getters are configurable by default, so same-
+ * realm code could `Object.defineProperty(Intent.prototype, "id",
+ * { get: () => "i-forged" })` — branding would still authenticate the
+ * correct private record (the real state moves correctly) while every
+ * fact that reads the presentation getter attributes the edge to a
+ * ghost. That severs ST-2's replay claim: private truth FAILED, replay
+ * under the forged id OPEN. Layer 1 (above) already keeps internal code
+ * off the getters; this layer closes the surface itself — behavior is
+ * part of the reachable object graph. The public getters remain, as
+ * presentation, for honest consumers. */
+Object.freeze(Intent.prototype);
+Object.freeze(AgentPrincipal.prototype);
+Object.freeze(ContextView.prototype);
 
 /* ---------- the system: host-plane glue ---------- */
 
@@ -412,7 +439,7 @@ export class AgentSystem {
     // clone were removed, no journal event could alias the input graph.
     const rec = this.#R(intent);
     this.#fact({
-      t: "intent_open", intent: intent.id, agent: arec.id,
+      t: "intent_open", intent: rec.id, agent: arec.id,
       goal: rec.goal, budget: rec.budget, deadline: rec.deadline, approval: rec.approval,
       contract: rec.contract.map((o) => o.id),
     });
@@ -438,9 +465,10 @@ export class AgentSystem {
       contextSeed: rec.context.data,
       contract,
     });
-    rec.children.add(child.id);
+    const crec = this.#R(child);
+    rec.children.add(crec.id);
     this.#track(AGENT_PRIV.get(rec.agent), child);
-    this.#fact({ t: "intent_fork", intent: child.id, parent: parentIntent.id, agent: rec.agent.id });
+    this.#fact({ t: "intent_fork", intent: crec.id, parent: rec.id, agent: AGENT_PRIV.get(rec.agent).id });
     this.#transition(child, "open", "fork"); // genesis rides the same primitive
     return child;
   }
@@ -462,11 +490,12 @@ export class AgentSystem {
       contextSeed: rec.context.data,
       contract,
     });
-    rec.children.add(child.id);
+    const crec = this.#R(child);
+    rec.children.add(crec.id);
     this.#track(target, child);
     this.#fact({
-      t: "intent_delegate", intent: child.id, parent: parentIntent.id,
-      from: rec.agent.id, to: target.id,
+      t: "intent_delegate", intent: crec.id, parent: rec.id,
+      from: AGENT_PRIV.get(rec.agent).id, to: target.id,
     });
     this.#transition(child, "open", "delegate"); // genesis rides the same primitive
     return child;
@@ -490,7 +519,7 @@ export class AgentSystem {
       rec.contract.push({ ...ob, bornRevision: rec.contractRevision, bornEpoch: rec.ownerEpoch });
     }
     this.#fact({
-      t: "contract_amend", intent: intent.id, revision: rec.contractRevision,
+      t: "contract_amend", intent: rec.id, revision: rec.contractRevision,
       epoch: rec.ownerEpoch, added: added.map((o) => o.id),
     });
     return rec.contract.map((o) => o.id);
@@ -515,8 +544,8 @@ export class AgentSystem {
     const rec = this.#R(intent);
     this.#guardLive(rec);
     const from = AGENT_PRIV.get(rec.agent);
-    from.intents.delete(intent.id);
-    target.intents.set(intent.id, intent);
+    from.intents.delete(rec.id);
+    target.intents.set(rec.id, intent);
     rec.agent = targetAgent;
     for (const { cap } of rec.envelope) {
       try { this.rt.revoke(cap); } catch { /* already dead — foreign/revoked */ }
@@ -525,15 +554,16 @@ export class AgentSystem {
     rec.envelope = []; // new holder must re-grant before it can call
     rec.ownerEpoch += 1; // HO-1: work and promises order against the epoch they were made under
     this.#fact({
-      t: "intent_handoff", intent: intent.id, from: from.id, to: target.id,
+      t: "intent_handoff", intent: rec.id, from: from.id, to: target.id,
       envelope: "revoked", slots, ownerEpoch: rec.ownerEpoch,
     });
     return intent;
   }
 
   suspend(intent) {
+    const rec = this.#R(intent);
     this.#transition(intent, "suspended", "suspend");
-    this.#fact({ t: "intent_suspend", intent: intent.id, agent: this.#R(intent).agent.id });
+    this.#fact({ t: "intent_suspend", intent: rec.id, agent: AGENT_PRIV.get(rec.agent).id });
   }
 
   /** Resume optionally rebinds the EXECUTING MODEL: the principal,
@@ -554,7 +584,7 @@ export class AgentSystem {
       this.#fact({ t: "agent_rebind", agent: arec.id, from: prev, to: model });
     }
     this.#transition(intent, "active", "resume");
-    this.#fact({ t: "intent_resume", intent: intent.id, agent: arec.id });
+    this.#fact({ t: "intent_resume", intent: rec.id, agent: arec.id });
   }
 
   /** Approve with a SCOPE: the plain-data envelope of what was agreed;
@@ -568,7 +598,7 @@ export class AgentSystem {
       throw new SubstrateError("E_STATE", "this intent never required approval");
     }
     rec.approval = { approved: cloneContext(scope), at: nowIso() };
-    this.#fact({ t: "intent_approve", intent: intent.id, scope: rec.approval.approved });
+    this.#fact({ t: "intent_approve", intent: rec.id, scope: rec.approval.approved });
   }
 
   /** Grant authority INTO the intent's envelope. Host presents the source
@@ -582,7 +612,7 @@ export class AgentSystem {
     const rec = this.#R(intent);
     this.#guardLive(rec);
     const arec = AGENT_PRIV.get(rec.agent);
-    const slot = `intent:${intent.id}:${fromSlot}`;
+    const slot = `intent:${rec.id}:${fromSlot}`;
     const membranes = rec.budget ? [rateLimit(rec.budget.calls)] : [];
     const cap = this.rt.grantCap(
       this.rt.holds(fromControl, fromSlot),
@@ -592,7 +622,7 @@ export class AgentSystem {
     );
     this.#activate(intent, rec, "grant");
     rec.envelope.push({ slot, cap });
-    this.#fact({ t: "intent_grant", intent: intent.id, agent: arec.id, slot, tool: fromSlot });
+    this.#fact({ t: "intent_grant", intent: rec.id, agent: arec.id, slot, tool: fromSlot });
     return slot;
   }
 
@@ -609,7 +639,7 @@ export class AgentSystem {
   async call(intent, slot, args, { for: obligationIds = [] } = {}) {
     const rec = this.#R(intent);
     const denied = (code, msg) => {
-      this.#fact({ t: "intent_call", intent: intent.id, slot, outcome: "denied", code });
+      this.#fact({ t: "intent_call", intent: rec.id, slot, outcome: "denied", code });
       throw new SubstrateError(code, msg);
     };
     this.#guardLive(rec); // terminal states throw E_STATE here
@@ -627,7 +657,7 @@ export class AgentSystem {
     const byId = new Map(rec.contract.map((o) => [o.id, o]));
     for (const oid of obligationIds) {
       if (!byId.has(oid)) {
-        denied("E_INVAL", `dispatch binds no obligation: '${oid}' is not in ${intent.id}'s contract at revision ${rec.contractRevision}`);
+        denied("E_INVAL", `dispatch binds no obligation: '${oid}' is not in ${rec.id}'s contract at revision ${rec.contractRevision}`);
       }
     }
     this.#activate(intent, rec, "call"); // admitted: the attempt may now be charged
@@ -640,22 +670,22 @@ export class AgentSystem {
       // the xact exists, before the handler runs, reading the private
       // record's (epoch, revision) as they stand at dispatch (CO-5).
       const req = this.rt.request(AGENT_PRIV.get(rec.agent).control, slot, args, {
-        correlationId: intent.id,
+        correlationId: rec.id,
         deadline: rec.deadline,
         onAdmit: (x) => {
           xact = x;
           this.#fact({
-            t: "intent_dispatch", intent: intent.id, slot, xact: x,
+            t: "intent_dispatch", intent: rec.id, slot, xact: x,
             ownerEpoch: rec.ownerEpoch, contractRevision: rec.contractRevision,
             obligationIds: [...new Set(obligationIds)],
           });
         },
       });
       const result = await req.promise;
-      this.#fact({ t: "intent_call", intent: intent.id, slot, xact, outcome: "ok" });
+      this.#fact({ t: "intent_call", intent: rec.id, slot, xact, outcome: "ok" });
       return { xact, result };
     } catch (e) {
-      this.#fact({ t: "intent_call", intent: intent.id, slot, xact, outcome: "fail", code: e.code ?? null });
+      this.#fact({ t: "intent_call", intent: rec.id, slot, xact, outcome: "fail", code: e.code ?? null });
       throw e;
     }
   }
@@ -669,7 +699,7 @@ export class AgentSystem {
     this.#guardLive(rec);
     const fromVersion = rec.context.advance(next, "mutate", undefined);
     this.#fact({
-      t: "context_version", intent: intent.id,
+      t: "context_version", intent: rec.id,
       fromVersion, toVersion: rec.context.version, cause: "mutate",
     });
     return rec.context.view.version;
@@ -686,13 +716,13 @@ export class AgentSystem {
     if (rec.state === "revoked") {
       throw new SubstrateError("E_STATE", "a revoked intent contributes no context");
     }
-    this.#fact({ t: "intent_merge", intent: childIntent.id, into: parent.id, accept });
+    this.#fact({ t: "intent_merge", intent: rec.id, into: this.#R(parent).id, accept });
     if (accept) {
       const prec = this.#R(parent);
-      const fromVersion = prec.context.advance(rec.context.data, "merge", childIntent.id);
+      const fromVersion = prec.context.advance(rec.context.data, "merge", rec.id);
       this.#fact({
-        t: "context_version", intent: parent.id,
-        fromVersion, toVersion: prec.context.version, cause: "merge", child: childIntent.id,
+        t: "context_version", intent: prec.id,
+        fromVersion, toVersion: prec.context.version, cause: "merge", child: rec.id,
       });
     }
     return parent.context.snapshot();
@@ -717,7 +747,7 @@ export class AgentSystem {
     if (!Array.isArray(claims) || claims.length === 0) {
       throw new SubstrateError("E_NO_EVIDENCE", "completion requires at least one evidence item");
     }
-    const backed = this.#journalBackedXacts(intent);
+    const backed = this.#journalBackedXacts(rec.id);
     for (const item of claims) {
       const isBacked = !!(item && item.xact && backed.has(item.xact));
       if (item && item.xact && !isBacked) {
@@ -729,7 +759,7 @@ export class AgentSystem {
       throw new SubstrateError("E_NO_EVIDENCE", "no evidence item is backed by the ledger");
     }
     this.#transition(intent, "completed", "complete");
-    this.#fact({ t: "intent_complete", intent: intent.id, agent: rec.agent.id, evidence: rec.evidence.length });
+    this.#fact({ t: "intent_complete", intent: rec.id, agent: AGENT_PRIV.get(rec.agent).id, evidence: rec.evidence.length });
     return intent;
   }
 
@@ -737,17 +767,17 @@ export class AgentSystem {
     if (!Array.isArray(claims)) {
       throw new SubstrateError("E_INVAL", "completion takes a list of {xact, obligation} claims");
     }
-    const backed = this.#journalBackedXacts(intent);
-    const bindings = this.#dispatchBindings(intent);
+    const backed = this.#journalBackedXacts(rec.id);
+    const bindings = this.#dispatchBindings(rec.id);
     const discharged = new Map(rec.contract.map((o) => [o.id, new Set()]));
     const refuse = (claim, why) => {
-      this.#fact({ t: "completion_denied", intent: intent.id, claim: claim ?? null, why });
+      this.#fact({ t: "completion_denied", intent: rec.id, claim: claim ?? null, why });
       throw new SubstrateError("E_NO_EVIDENCE", why);
     };
     for (const claim of claims) {
       const { xact, obligation } = claim ?? {};
       const bind = xact ? bindings.get(xact) : null;
-      if (!bind) refuse(claim, `claim xact '${xact ?? "—"}' has no dispatch binding on ${intent.id}`);
+      if (!bind) refuse(claim, `claim xact '${xact ?? "—"}' has no dispatch binding on ${rec.id}`);
       if (!backed.has(xact)) refuse(claim, `dispatch '${xact}' did not settle ok — a failed call discharges nothing`);
       if (!bind.obligationIds.includes(obligation)) {
         refuse(claim, `CO-5: '${xact}' was bound at dispatch to [${bind.obligationIds.join(", ") || "anonymous"}], not '${obligation}' — bindings precede effects`);
@@ -762,13 +792,13 @@ export class AgentSystem {
       .filter((o) => discharged.get(o.id).size < o.minOccurrences)
       .map((o) => o.id);
     if (unmet.length) {
-      this.#fact({ t: "completion_denied", intent: intent.id, unmet });
+      this.#fact({ t: "completion_denied", intent: rec.id, unmet });
       throw new SubstrateError("E_NO_EVIDENCE", `unmet obligations: ${unmet.join(", ")}`);
     }
     rec.evidence.push(...claims.map((c) => ({ ...cloneOrWrap(c), backed: true })));
     this.#transition(intent, "completed", "complete");
     this.#fact({
-      t: "intent_complete", intent: intent.id, agent: rec.agent.id,
+      t: "intent_complete", intent: rec.id, agent: AGENT_PRIV.get(rec.agent).id,
       contract: rec.contract.map((o) => o.id), evidence: rec.evidence.length,
     });
     return intent;
@@ -781,7 +811,7 @@ export class AgentSystem {
     const rec = this.#R(intent);
     this.#guardLive(rec);
     this.#transition(intent, "failed", "fail");
-    this.#fact({ t: "intent_fail", intent: intent.id, agent: rec.agent.id, reason: String(reason ?? "") });
+    this.#fact({ t: "intent_fail", intent: rec.id, agent: AGENT_PRIV.get(rec.agent).id, reason: String(reason ?? "") });
   }
 
   /** Revoke: the whole subtree dies; every envelope capability is revoked
@@ -801,7 +831,7 @@ export class AgentSystem {
         } catch { /* dead or foreign caps cannot block the fact of revocation */ }
       }
       this.#transition(intent, "revoked", "revoke");
-      this.#fact({ t: "intent_revoke", intent: intent.id, agent: rec.agent.id });
+      this.#fact({ t: "intent_revoke", intent: rec.id, agent: AGENT_PRIV.get(rec.agent).id });
     }
     for (const childId of rec.children) {
       const child = this.intents.get(childId);
@@ -810,24 +840,25 @@ export class AgentSystem {
   }
 
   #track(arec, intent) {
-    arec.intents.set(intent.id, intent);
-    this.intents.set(intent.id, intent);
+    const id = PRIV.get(intent).id; // record read, never the presentation getter (S2.1d)
+    arec.intents.set(id, intent);
+    this.intents.set(id, intent);
   }
 
-  #journalBackedXacts(intent) {
+  #journalBackedXacts(id) {
     const set = new Set();
     for (const { event } of this.rt.journalEntries()) {
-      if (event.t === "invoke" && event.correlationId === intent.id && event.outcome === "ok") set.add(event.xact);
+      if (event.t === "invoke" && event.correlationId === id && event.outcome === "ok") set.add(event.xact);
     }
     return set;
   }
 
   /* CO-5's read side: what the ledger says each dispatch was FOR. Facts
    * are the only source — no in-layer cache exists to be re-labelled. */
-  #dispatchBindings(intent) {
+  #dispatchBindings(id) {
     const m = new Map();
     for (const { event } of this.rt.journalEntries()) {
-      if (event.t === "intent_dispatch" && event.intent === intent.id) {
+      if (event.t === "intent_dispatch" && event.intent === id) {
         m.set(event.xact, {
           obligationIds: event.obligationIds ?? [],
           ownerEpoch: event.ownerEpoch,
@@ -863,16 +894,16 @@ export class AgentSystem {
     const legal = fromState === null ? toState === "open" : (LEGAL_EDGES[fromState]?.has(toState) ?? false);
     if (!legal) {
       this.#fact({
-        t: "intent_transition_denied", intent: intent.id,
+        t: "intent_transition_denied", intent: rec.id,
         fromState, toState, stateVersion: rec.stateVersion, cause,
       });
-      throw new SubstrateError("E_STATE", `intent ${intent.id}: ${fromState} → ${toState} is not a legal edge (state and version unchanged)`);
+      throw new SubstrateError("E_STATE", `intent ${rec.id}: ${fromState} → ${toState} is not a legal edge (state and version unchanged)`);
     }
     rec.state = toState;
     rec.stateVersion += 1;
     this.#fact({
-      t: "intent_state", intent: intent.id, fromState, toState,
-      stateVersion: rec.stateVersion, cause, agent: rec.agent.id,
+      t: "intent_state", intent: rec.id, fromState, toState,
+      stateVersion: rec.stateVersion, cause, agent: AGENT_PRIV.get(rec.agent).id,
     });
     return intent;
   }

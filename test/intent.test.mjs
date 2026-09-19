@@ -734,3 +734,61 @@ test("S2.1c ingress: approval scopes and model rebinds are owned values, not liv
   assert.equal(a.model, "m1"); // the refusal rebound nothing
   assert.equal(rt.verifyJournal(), true);
 });
+
+/* ---------- S2.1d: the behavior surface (round-10 blocker) ----------
+ * A frozen instance on a mutable prototype is a locked door in an
+ * unlockable wall: class getters are configurable, so same-realm code
+ * can redefine what `intent.id` RETURNS — branding still authenticates
+ * the true record (state moves correctly) while every fact written
+ * through the presentation getter attributes the edge to a ghost. */
+
+test("ST-3: the view prototypes are frozen — behavior is part of the reachable graph", () => {
+  const { sys, intent, agent } = harness();
+  for (const [name, proto] of [
+    ["Intent", Object.getPrototypeOf(intent)],
+    ["AgentPrincipal", Object.getPrototypeOf(agent)],
+    ["ContextView", Object.getPrototypeOf(intent.context)],
+  ]) {
+    // pre-fix: Object.freeze(instance) stopped at the instance; the
+    // prototype — the behavior every getter call dispatches through —
+    // was a plain mutable object
+    assert.equal(Object.isFrozen(proto), true, `${name}.prototype is MUTABLE`);
+  }
+  assert.throws(() => Object.defineProperty(Object.getPrototypeOf(intent), "id", { configurable: true, get() { return "i-forged"; } }), isTE);
+  assert.throws(() => Object.defineProperty(Object.getPrototypeOf(agent), "id", { configurable: true, get() { return "a-forged"; } }), isTE);
+  assert.throws(() => Object.defineProperty(Object.getPrototypeOf(intent.context), "version", { configurable: true, get() { return 99; } }), isTE);
+});
+
+test("ST-2: an attempted prototype-id spoof cannot misattribute a transition — facts carry the private id", () => {
+  const rt = new Runtime();
+  const sys = new AgentSystem(rt);
+  const a = sys.register("a");
+  const intent = sys.open(a, { goal: { o: 1 } });
+  const canonical = intent.id;
+  let threw = false;
+  try {
+    // the reviewer's attack verbatim. PRE-FIX this SUCCEEDS silently:
+    // the class getter is configurable, so the prototype takes the
+    // spoof and every downstream `intent.id` read lies.
+    Object.defineProperty(Object.getPrototypeOf(intent), "id", { configurable: true, get() { return "i-forged"; } });
+  } catch (e) {
+    threw = e.name === "TypeError"; // cross-realm-safe
+  }
+  assert.equal(threw, true); // pre-fix: no throw — the spoof landed
+  sys.fail(intent, "round-10 oracle");
+  const last = evs(rt, "intent_state").at(-1);
+  // pre-fix (with the spoof landed): the fact says intent: "i-forged"
+  // while the REAL record moved to failed — private truth FAILED,
+  // replay(originalId) stuck at OPEN: ST-2's claim, severed.
+  assert.equal(last.intent, canonical);
+  assert.equal(last.toState, "failed");
+  let st = null, ver = -1;
+  for (const e of evs(rt, "intent_state")) {
+    if (e.intent !== canonical) continue;
+    assert.equal(e.fromState, st, "replay must chain without ambiguity");
+    assert.equal(e.stateVersion, ver + 1);
+    st = e.toState; ver = e.stateVersion;
+  }
+  assert.equal(st, "failed"); // replay == private view, under the canonical id
+  assert.equal(intent.state, "failed");
+});

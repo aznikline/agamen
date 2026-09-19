@@ -19,10 +19,12 @@ must be enforced). Agate *enforces*; Agamen *defines what should exist*.
 > state is derived from facts — one fully private record, one lifecycle
 > writer, one owning ledger per intent, and the read-only boundary is
 > transitive over the whole reachable object graph — and bidirectional:
-> no mutable aliases out, no caller-owned aliases in (agents are inert
+> no mutable aliases out, no caller-owned aliases in, and behavior is
+> part of the boundary (frozen prototypes; identity is record data,
+> getters are presentation; agents are inert
 > AgentPrincipal views, context an immutable ContextVersion stream,
 > ledger facts owned before they are hashed);
-> 51 invariant + 42 APM tests;
+> 51 invariant + 44 APM tests;
 > Node ≥ 20, dependency-free. M2 (approval leases) stays blocked by
 > design.
 > [Why "Agamen"?](docs/name.md) · [Design thesis](docs/thesis.md) ·
@@ -135,7 +137,7 @@ await sys.complete(intent, [{ xact, obligation: "report_written" }]);
 src/runtime.js                     the substrate (actors/caps/membranes/journal/schedule)
 src/intent.js                      the Agent Process Model (Track S; spec/apm.md)
 test/runtime.test.mjs              invariant suite (51 tests)
-test/intent.test.mjs               APM lifecycle + negative suite (42 tests)
+test/intent.test.mjs               APM lifecycle + negative suite (44 tests)
 bench/run.mjs                      tier 1-2 measurement harness (paired protocol)
 bench/baseline.md                  fitted per-invoke cost model (M1.6 snapshot)
 spec/invariants.md                 normative invariants + threat model + acceptance

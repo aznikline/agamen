@@ -58,7 +58,7 @@ provable against each other. The negative gate is the milestone:
 `complete()` refuses without at least one evidence item backed by a
 journaled `ok` invocation. Acceptance: 13 lifecycle + negative tests.
 
-## S2 — APM as normative spec (rev. S2.0.6, `spec/apm.md`)
+## S2 — APM as normative spec (rev. S2.0.7, `spec/apm.md`)
 
 The spec stands on its own, independent of the JavaScript prototype. It
 is built on three separations — **Ownership is not authority. Evidence
@@ -278,6 +278,35 @@ inside a hashed event), and all 38 older tests pass unchanged on
 pre-fix (no API adaptations this round, unlike S2.1b). Next, in spec
 order and with the §8 item 2 pre-works first inside it: the COMPLETING
 skeleton → DC-5.
+
+**S2.1d progress** (2026-09-20, prototype closure, round-10 directive):
+the review of `1f93ffe` signed S2.1c but named the last JS-specific
+hole in the reachable graph — the PROTOTYPE CHAIN. Frozen instances
+sat on mutable prototypes, and class getters are configurable by
+default: `Object.defineProperty(Intent.prototype, "id", {get:
+() => "i-forged"})` leaves `#R` branding authenticating the true
+record (real state moves correctly) while every fact written through
+the presentation getter attributes the edge to a ghost — private
+truth FAILED, replay(originalId) stuck at OPEN: ST-2's core claim
+severed through BEHAVIOR, not any field. Both layers landed, as
+directed, not either/or: (1) authoritative identity is now record data
+— intent id lives in PRIV, and internal code resolves ids through
+PRIV/AGENT_PRIV everywhere (a grep-enforced discipline: no
+`intent.id`/`rec.agent.id` inside the system); the public getters are
+presentation only; (2) `Intent.prototype`, `AgentPrincipal.prototype`,
+`ContextView.prototype` are frozen — the read-only view now includes
+its own behavior surface. Two oracles: `the view prototypes are
+frozen` and the teeth-carrying `an attempted prototype-id spoof
+cannot misattribute a transition`. 44/44 APM + 51/51 invariant;
+against pre-fix `1f93ffe` exactly the two new tests fail (the spoof
+lands silently there) and all 42 older pass unchanged. `runtime.js`
+untouched; CO-5 shape unchanged; ST-4 not claimed. Round 10 also
+fixed the COMPLETING order — plain-data snapshot domain FIRST (its
+new reason: provenance hashes events via JSON shape, so two different
+Maps already hash identically — exotic values break hash-content
+binding TODAY), then immutable ContextVersion values, then the four
+obligation kinds. **Trusted-state closure is declared finished; next
+slice, unconditionally: COMPLETING.**
 
 # Track E — enforcement
 

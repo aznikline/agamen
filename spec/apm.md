@@ -1,6 +1,6 @@
 # APM — the Agamen Agent Process Model (normative, S2)
 
-> Status: **normative spec, rev. S2.0.6** — it stands on its own;
+> Status: **normative spec, rev. S2.0.7** — it stands on its own;
 > `src/intent.js` (S1) is its first, partial implementation. S2.0.1 closed
 > the spec-review gaps (§8 lists the six pins); S2.0.2 is the round-6
 > honesty patch: CO-5 is defined as a three-phase order (binding
@@ -18,7 +18,11 @@
 > the round-9 ingress ownership closure (S2.1c): the boundary made
 > BIDIRECTIONAL — no mutable aliases out AND no caller-owned aliases in
 > (inputs clone-ingress into private records; every fact is deep-owned
-> before the ledger, which does not clone events).
+> before the ledger, which does not clone events); S2.0.7 is the
+> round-10 prototype closure (S2.1d): the boundary now covers the
+> BEHAVIOR surface — view prototypes are frozen, and authoritative
+> identity is record data that internal code never reads through a
+> presentation getter.
 > ST-4 remains explicitly NOT claimed.
 > This file inherits the
 > vocabulary of `spec/invariants.md` and the track definitions of
@@ -211,8 +215,18 @@ ST-3  Lifecycle state is private to the model layer; principals get
       not just state), and identity-ish inputs are narrowed to
       immutable forms: label is a string, model is null | string
       (a structured ModelBinding gets its own object when it lands),
-      deadline is null | finite number. [pinned in S2.1a + S2.1b +
-      S2.1c: `every determinable
+      deadline is null | finite number. And the boundary covers the
+      BEHAVIOR surface (S2.1d): a frozen instance on a mutable
+      prototype is a locked door in an unlockable wall — class getters
+      are configurable by default, so redefining one on a view's
+      prototype rewrites what every read of that view returns. View
+      prototypes (Intent, AgentPrincipal, ContextView) are therefore
+      frozen, and authoritative identity is RECORD data: internal code
+      resolves ids through the records, never through a presentation
+      getter, so even a hypothetical getter rewrite could not
+      misattribute a fact. The public getters are presentation only.
+      [pinned in S2.1a + S2.1b +
+      S2.1c + S2.1d: `every determinable
       field is read-only from the token`, `relations and configuration
       are decision-relevant too` (assignment to any of agent/parent/
       children/goal/budget/deadline/approval/context/id/openedAt is a
@@ -232,7 +246,10 @@ ST-3  Lifecycle state is private to the model layer; principals get
       survives tampering with the input graph), `S2.1c ingress: even a
       DENIED claim's object cannot stay aliased inside the ledger`,
       `S2.1c ingress: approval scopes and model rebinds are owned
-      values`]
+      values`, `the view prototypes are frozen`,
+      `an attempted prototype-id spoof cannot misattribute a
+      transition` (private truth, ledger attribution and replay stay
+      in agreement even when the presentation getter is attacked)]
 ST-4  Intent transition serial order: effect dispatch, handoff, revoke
       (including each cascade leg), approval consumption,
       amend/supersede, and every lifecycle edge on one intent are
@@ -593,6 +610,32 @@ immutability over Map/Set) are recorded as COMPLETING pre-works in
 item 2 — the `context` obligation must not land on either shortcut.
 Still: substrate untouched, CO-5 shape unchanged, ST-4 unclaimed.
 
+**S2.0.7 (round-10 prototype closure, landed 2026-09-20 — code slice
+S2.1d)** — the review of 1f93ffe approved S2.1c but named the last
+JS-specific hole in ST-3's reachable graph: the PROTOTYPE CHAIN.
+`Object.freeze(instance)` leaves `Object.getPrototypeOf(instance)`
+mutable, and class getters are configurable — so same-realm code could
+redefine `Intent.prototype.id` to return a ghost. Branding still
+authenticated the true record (real state moved correctly) but facts
+written through the presentation getter attributed the edge to the
+ghost: private truth FAILED while replay(originalId) stuck at OPEN —
+ST-2's core claim severed through the behavior surface, not any field.
+Landed, both layers as directed: (1) authoritative identity is RECORD
+data (intent id, principal id resolved via PRIV/AGENT_PRIV everywhere
+internally — the public getters are presentation only, and a getter
+rewrite now misattributes nothing because nothing internal reads
+through it); (2) Intent/AgentPrincipal/ContextView prototypes frozen —
+the read-only view now includes its own behavior. Pinned by
+`the view prototypes are frozen` and the teeth-carrying
+`an attempted prototype-id spoof cannot misattribute a transition`
+(fails against 1f93ffe exactly where predicted: the spoof lands
+silently). The review also fixed the COMPLETING order — plain-data
+domain → ContextVersion values → four obligation kinds — now recorded
+in item 2 with its reason (JSON-shaped provenance hashing already
+binds exotic values like two different Maps to the same bytes). With
+this, the trusted-state closure is declared FINISHED: the next slice
+is COMPLETING, unconditionally.
+
 **S2.1 (next code, in this order — reordered after round-5 review so no
 check ever runs against mutable truth)**
 
@@ -609,16 +652,23 @@ check ever runs against mutable truth)**
    plus the WORKING-SET COMMIT RULE for candidate evidence (claims are
    verified against a temporary set; `rec.evidence` changes only at
    COMPLETING → COMPLETED; denials mutate no truth — closes the
-   round-7 deferred gap on the legacy path); plus the ROUND-9
-   PRE-WORKS, required because the `context` obligation reads them:
-   (a) an immutable per-version ContextVersion VALUE — today's
-   ContextView is a read-only LIVE cursor (version/snapshot track the
-   head), so completion evidence must bind a detached
-   `{version, snapshot, lineage-ref}` value, not a moving view;
-   (b) the PLAIN-DATA SNAPSHOT DOMAIN — Map/Set/Date/class instances
-   are structured-cloneable but freezeDeep gives them no immutable
-   semantics, which poisons any `Object.isFrozen` oracle; refuse them
-   at the door instead of inventing immutable wrappers;
+   round-7 deferred gap on the legacy path); plus the ROUND-9/10
+   PRE-WORKS, required because the `context` obligation reads them,
+   in this fixed order (round-10: 先冻域，再造值，最后四种 obligation —
+   do not reverse it):
+   (a) first, the PLAIN-DATA SNAPSHOT DOMAIN — Map/Set/Date/class
+       instances are structured-cloneable but freezeDeep gives them no
+       immutable semantics (poisoning any `Object.isFrozen` oracle),
+       AND worse: provenance hashes events via JSON shape, so
+       `new Map([["x",1]])` and `new Map([["totallyDifferent",999]])`
+       both serialize to `{}` — an exotic value in a fact already
+       breaks hash-content binding, and a cycle can throw inside
+       `record()` itself. Refuse exotic values at the APM door;
+   (b) then immutable per-version ContextVersion VALUES — today's
+       ContextView is a read-only LIVE cursor (version/snapshot track
+       the head), so completion evidence must bind a detached
+       `{version, snapshot, lineage-ref}` value, not a moving view;
+   (c) only then the four obligation kinds;
 3. closure negative gate first, as a test before the feature (DC-5);
 4. ~~dispatch-time binding~~ LANDED (CO-5 pinned by the temporal test;
    written in the substrate's admit hook, refusing matcher included);
