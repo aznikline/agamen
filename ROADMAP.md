@@ -56,33 +56,28 @@ provable against each other. The negative gate is the milestone:
 `complete()` refuses without at least one evidence item backed by a
 journaled `ok` invocation. Acceptance: 13 lifecycle + negative tests.
 
-## S2 — APM as normative spec (next)
+## S2 — APM as normative spec (spec landed 2026-09-19, `spec/apm.md`)
 
-Promote the experiment: `spec/apm.md` fixing the intent lifecycle state
-machine and the delegation graph. S2 is not the current API transcribed
-to prose; it answers the four questions the S1 experiment exposed:
+The spec stands on its own, independent of the JavaScript prototype. It
+is built on three separations — **Ownership is not authority. Evidence
+is not correctness. Identity is not execution** — and answers the four
+questions the S1 experiment exposed: the two-graph model (delegation
+graph ⊥ derivation graph, consent as the only lawful bridge; handoff
+proves the split), the intent state machine with a verification state
+(`COMPLETING`) and ledger-replayable transitions, completion as a
+frozen **CompletionContract** of machine-checkable obligations
+(receipt/approval/closure/context) discharged by ledger-backed evidence
+— never a claim about the world — and **attention as a resource**
+(AttentionRequest: scope, expiry, consumption, transferability) with
+M2's lease question explicitly deferred until the object is stable.
+Handoff gains an ownership epoch: late receipts count as history,
+never as authorization.
 
-1. **What handoff transfers.** S1's settled answer, to be tested: the
-   intent (goal, context, approval state, budget accounting, children,
-   evidence) moves; the envelope does NOT — relocating a grant without
-   the granter's re-consent would be ambient authority. S2 must define
-   the re-delegation protocol and what happens to *in-flight* calls.
-2. **Completion obligation.** `complete(evidence)` currently proves
-   "this intent made at least one successful call", not "the goal was
-   achieved." S2 defines which receipts correspond to which goal.
-3. **Delegation-graph closure.** May a parent complete while children
-   are still live? Today: yes, silently. S2 makes closure a rule with
-   its own journal facts.
-4. **Approval/attention as a resource.** Is approval a boolean gate, or
-   a human resource that can be waited on, expired, forwarded, and
-   consumed? The shape decides M2's lease semantics — M2 stays blocked
-   until S2 answers.
-
-Plus one hardening debt S1 leaves open: `Intent.state/approval/evidence`
-are public fields — fine while S1 is an experiment, but the strong
-claim ("an agent cannot claim it finished") requires the lifecycle
-state to be private behind read-only views in S2. The APM graduate to
-"OS-primitive-shaped" claims only past the decision test above.
+**S2.1** (next code, order fixed by the spec §8): lifecycle
+privatization, contract + COMPLETING, the closure negative gate first
+(no parent completion over live required children — S1 permits it
+today), join policies (required/optional/race/detached), epoch
+stamping, AttentionRequest. No runtime features ride along.
 
 # Track E — enforcement
 

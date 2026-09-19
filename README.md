@@ -19,7 +19,8 @@ must be enforced). Agate *enforces*; Agamen *defines what should exist*.
 > Node ≥ 20, dependency-free. M2 (approval leases) stays blocked by
 > design.
 > [Why "Agamen"?](docs/name.md) · [Design thesis](docs/thesis.md) ·
-> [Invariants (normative)](spec/invariants.md) · [Evaluation charter](docs/evaluation.md) · [Roadmap](ROADMAP.md)
+> [Invariants (normative)](spec/invariants.md) · [APM (normative, S2)](spec/apm.md) ·
+> [Evaluation charter](docs/evaluation.md) · [Roadmap](ROADMAP.md)
 
 ## The five primitives
 
@@ -96,14 +97,17 @@ views. `new Runtime({ bench: true })` swaps in a constant-time,
 **non-conforming** audit sink for cost-model fitting only; events are
 still generated and the `rt.conforming` getter reports the deviation.
 
-## Agent Process Model (S1 experiment, `src/intent.js`)
+## Agent Process Model (S2 spec: [`spec/apm.md`](spec/apm.md); S1 experiment: `src/intent.js`)
 
-The semantic track's first artifact: `AgentExecution` (a principal that
-survives model rebinds) and `Intent` (goal + authority envelope + budget
-+ deadline + approval state + context lineage) with fork / delegate /
-handoff / suspend / resume(model) / approve / revoke / merge_context /
-complete(evidence). Enforcement stays in the substrate; the layer owns
-lifecycle facts — and the gate is provable:
+The semantic track's normative model — two graphs (delegation ≠ capability
+derivation), the intent state machine with waiting states, CompletionContract,
+delegation closure, and handoff epochs — is in `spec/apm.md`; S1's
+`src/intent.js` is its first executable sketch. The layer's core objects:
+`AgentExecution` (a principal that survives model rebinds) and `Intent`
+(goal + authority envelope + budget + deadline + approval state + context
+lineage) with fork / delegate / handoff / suspend / resume(model) / approve /
+revoke / merge_context / complete(evidence). Enforcement stays in the
+substrate; the layer owns lifecycle facts — and the gate is provable:
 
 ```js
 const sys = new AgentSystem(rt);
@@ -125,11 +129,12 @@ bench/run.mjs                      tier 1-2 measurement harness (paired protocol
 bench/baseline.md                  fitted per-invoke cost model (M1.6 snapshot)
 spec/invariants.md                 normative invariants + threat model + acceptance
                                    (inherited from agate spec 13, ids preserved)
+spec/apm.md                        S2: the Agent Process Model (normative)
 kernel/uapi/                       reference ABI seed (capability rights algebra)
 docs/name.md                       the Agamemnon case
 docs/thesis.md                     the form, the two tracks, and the backend question
 docs/evaluation.md                 measurement charter (quantitative method)
-ROADMAP.md                         Track S (S0–S2) and Track E (M0–M5)
+ROADMAP.md                         Track S (S0–S2.1) and Track E (M0–M5)
 ```
 
 ## Relationship to Agate
