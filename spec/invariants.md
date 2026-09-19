@@ -16,60 +16,79 @@ agents a **deterministic execution boundary**:
   delegation;
 - tool calls and agent-to-agent messages traverse the mediation point, where
   the substrate stamps the caller;
-- address spaces, context, and budgets are isolated per principal;
+- budgets attach to grants and are shared only within that grant's derivation
+  subtree; sibling subtrees are independent; values cross principal boundaries
+  by structured clone, never by shared mutable reference;
 - high-risk actions can pause and resume through short-lived capabilities;
-- authorization and communication events form linked, eventually verifiable
-  evidence.
+- authorization and communication events form a linked chain, internally
+  hash-consistent for the process lifetime; external anchoring and signing
+  are future work.
+
+**Enforcement threat model (M1.5 onward):** the adversary is hostile
+JavaScript running in the same realm as the substrate — it holds actor and
+capability tokens, receives handler contexts, and may mutate anything
+reachable. "Enforced" below means *against that adversary*. Anything weaker
+is labelled simulated or normative. The M1-era implementation did not meet
+this bar; an external review (2026-09-19) forced the re-scoping and the M1.5
+rework described in `ROADMAP.md`.
 
 ## Invariants
 
-| # | Invariant | v0 status (this repo) |
+| # | Invariant | v1.5 status (this repo) |
 |---|---|---|
-| 1 | **Zero ambient authority** — a new agent's capability table starts empty. | enforced, tested |
-| 2 | **Monotonic decay** — derived rights ⊆ source rights, always. | enforced, tested |
-| 3 | **Full mediation** — every cross-principal call checks capability + rights. | enforced (runtime chokepoint) |
-| 4 | **Non-forgeable identity** — the receiver's view of the sender is substrate-bound, never payload-borne. | simulated (actor-reference); hardening tracked in ROADMAP M3 |
+| 1 | **Zero ambient authority** — a new agent's capability table starts empty. | enforced, tested — tokens expose no state; handler/membrane ctx carries immutable metadata only (no actor/capability objects) |
+| 2 | **Monotonic decay** — derived rights ⊆ source rights, always. | enforced, tested — rights live in runtime-private WeakMaps; holder mutation is impossible, not merely checked |
+| 3 | **Full mediation** — every cross-principal call checks capability + rights. | enforced, tested — invoke needs `send`; `tell` needs a mailbox capability targeting the receiver with `send`; delegation needs `grant`; targets are unreachable around the chokepoint (opaque tokens) |
+| 4 | **Non-forgeable identity** — the receiver's view of the sender is substrate-bound, never payload-borne. | simulated (runtime-branded actor reference; payload identity ignored) — transport-bound stamping is ROADMAP M3 |
 | 5 | **Atomic creation** — spawn is all-or-nothing; no half-authorized child runs. | not applicable in-process; normative for M5 |
-| 6 | **Revocation reachability** — delegation enters the derivation tree; revoked roots kill every descendant. | enforced, tested |
-| 7 | **Memory isolation** *(kernel-only)* — no ungranted reads/writes across spaces. | normative for M5 |
+| 6 | **Revocation reachability** — delegation enters the derivation tree; revoked roots kill every descendant. | enforced, tested — `revoked` is private state; un-revoking from the holder side is impossible |
+| 7 | **Memory isolation** *(kernel-only)* — no ungranted reads/writes across spaces. | in-realm analogue enforced: no shared mutable values across principal boundaries (structured clone); address-space isolation normative for M5 |
 | 8 | **Pointer safety** *(kernel-only)* — untrusted references validated before dereference. | normative for M5 |
-| 9 | **Explicit completion** — success / failure / cancel / timeout / waiting-approval / waiting-resource are distinct states. | enforced (M1): `ok` / `fail` / `cancelled` / `timeout` are journaled outcomes; `shed` and `expire` are queue states; approval pending M2 |
-| 10 | **Audit completeness** — allows *and* denials at the mediation point are journaled; no bypass path. | enforced (denials now journaled as `invoke_denied` under the same xact as the attempt) |
-| 11 | **Policy outside the model** — output may request, never widen. | enforced (membranes) |
+| 9 | **Explicit completion** — success / failure / cancel / timeout / waiting-approval / waiting-resource are distinct states. | enforced for the caller-facing contract: `cancel()`/`tick()` settle outcomes regardless of handler cooperation; `ok/fail/cancelled/timeout` journaled; `shed`/`expire` queue states; cancellation means **delivery cancelled**, and the ledger says so (`delivery:"cancelled"` + later `handler_settled` facts); approval pending M2 |
+| 10 | **Audit completeness** — allows *and* denials at the mediation point are journaled; no bypass path. | enforced within the documented scope: lookup, rights, policy, grant and delivery denials all journal; the only measurement seam is the explicitly non-conforming bench sink (`rt.conforming === false`), which still generates events. The chain is in-memory and internally hash-consistent for the process lifetime — NOT tamper-evident against an attacker with process access until externally anchored (M3+) |
+| 11 | **Policy outside the model** — output may request, never widen. | enforced, tested — membrane state is private per grant subtree; holders cannot drop or rewrite membranes |
 | 12 | **Protocol decoupling** — MCP/A2A changes never alter the substrate ABI. | by construction (no wire layer yet) |
 
 ## Threat model (carried from spec 13 §14)
 
-| Threat | Required control |
-|---|---|
-| prompt injection induces privilege growth | capability allowlist, out-of-model policy, sensitive-action approval |
-| confused deputy | substrate-stamped sender, endpoint-bound capability, target-bound tokens |
-| identity self-declaration | ignore payload identity; trust only mediation metadata |
-| capability leak | empty default table, minimal rights, derivation/revoke, short leases (M2) |
-| replay | xact ids, nonce/expiry, tool-side idempotency |
-| context poisoning | read/write capability split, version lineage, digests, provenance labels |
-| malicious tool service | process/actor isolation, output validation, no reverse ambient authority |
-| DoS / runaway agent | membranes with budgets, deadlines, cancel, backpressure (**M1: enforced** — deadline admission, xact cancel, mailbox shed/block) |
-| post-approval substitution | approval binds args hash + code/context version (M2) |
-| audit overwrite/tampering | hash chain (v0), export + signing batches (later) |
+| Threat | Required control | v1.5 status |
+|---|---|---|
+| prompt injection induces privilege growth | capability allowlist, out-of-model policy, sensitive-action approval | enforced in-realm (opaque rights; approval = M2) |
+| confused deputy | substrate-stamped sender, endpoint-bound capability, target-bound tokens | enforced in-realm; transport stamping M3 |
+| identity self-declaration | ignore payload identity; trust only mediation metadata | enforced (payload `sender` ignored) |
+| capability leak | empty default table, minimal rights, derivation/revoke, short leases (M2) | enforced; leases M2 |
+| replay | xact ids, nonce/expiry, tool-side idempotency | xact ids substrate-generated on collision-check; expiry enforced via tick |
+| context poisoning | read/write capability split, version lineage, digests, provenance labels | partial (digests via canonical hash domain; lineage M4) |
+| malicious tool service | process/actor isolation, output validation, no reverse ambient authority | reverse-authority closed in-realm (ctx metadata only; cloned values); preemption/isolation M3 |
+| DoS / runaway agent | membranes with budgets, deadlines, cancel, backpressure | enforced cooperatively: budget/deadline/cancel/shed/block; waiter queues bounded (`mailbox × 4`); blocked sends resolve, never reject; handler CPU cannot be stopped in-process (M3) |
+| post-approval substitution | approval binds args hash + code/context version (M2) | canonical total hash domain ready; collisions (undefined/NaN) closed; leases M2 |
+| audit overwrite/tampering | hash chain, then export + signing | internal chain only — do not claim evidence-grade until anchored |
 
-## Acceptance tests (from spec 13 §16, mapped)
+## Acceptance tests (mapped to `test/runtime.test.mjs`, finding refs = 2026-09-19 external review)
 
-| Test | v0 |
+| Test | v1.5 |
 |---|---|
-| zero-authority | `test/runtime.test.mjs` — *zero-authority* |
-| attenuation | — *attenuation* |
-| revocation | — *revocation-cascade* |
-| identity anti-forge | — *identity-stamp* (payload `sender` ignored) |
-| audit completeness | — *provenance* (quad + tamper-evidence) |
+| zero-authority | — *zero ambient authority; tokens expose no authority state (F2, F3)* |
+| attenuation | — *monotonic decay still enforced on the token API* |
+| revocation | — *revocation cascade is not undoable by holders (F2, #6)* |
+| full mediation (messaging) | — *full mediation: tell requires a send capability (F1a)*; *send-only capability cannot delegate (F1c)* |
+| identity anti-forge | — *payload identity is never trusted* |
+| no reverse authority | — *handler ctx carries immutable metadata (F3)*; *messages and results cross by structured clone (F12)* |
+| audit completeness | — *every denial class is journaled at the chokepoint (F8)*; *allow path journals the full quad (F10)* |
+| explicit completion | — *cancel settles a hung handler immediately (F4, F9)*; *tick() enforces deadlines (F4)*; *late result withheld (F9)* |
+| deadline/cancel | — *deadline in the past denies before admission*; *abort signal cancels* |
+| queue liveness | — *expired head unblocks the waiting sender (F5)*; *cancelling a queued message promotes a waiter (F5b)*; *blocked sends never reject (F6)*; *waiters bounded (F6)* |
+| hash domain | — *canonical hashes distinguish undefined/NaN, reject cycles without throwing (F11)* |
+| xact identity | — *caller xacts collide only with live transactions (F13)*; *runtime-branded E_FOREIGN (F14)* |
+| budget scope | — *membrane budgets per grant subtree (F15)*; *charged-attempt ordering (F15b)* |
+| non-conforming seam | — *bench sink is explicit (F7)* |
 | atomic spawn | pending M5 (kernel backend) |
 | pointer fault | pending M5 |
-| lifecycle | `test/runtime.test.mjs` — *lifecycle* (expire/cancel at delivery; ok/fail outcomes distinct, spec #9) |
-| deadline/cancel | — *deadline* denied pre-execution + late result withheld; *cancel* by xact id and pre-aborted signal |
 | context isolation | pending M4 |
 | approval binding | pending M2 |
 | protocol boundary | pending (no wire layer) |
 
-Contribution rule: any change to `src/runtime.js` MUST keep rows 1, 2, 6, 10,
-11 green and MUST add a negative test for any newly-enforced invariant before
-claiming it.
+Contribution rule: any change to `src/runtime.js` MUST keep rows 1, 2, 3, 6,
+10, 11 green and MUST add a negative test — written from the hostile
+same-realm JS adversary's point of view — for any newly-enforced invariant
+before claiming it.

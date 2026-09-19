@@ -1,26 +1,60 @@
 /**
- * Agamen v1 — actors + object capabilities + membranes + provenance +
- * scheduling semantics (M1).
+ * Agamen v1.5 — hardened substrate: actors + object capabilities +
+ * membranes + provenance + scheduling semantics.
  *
- * Deadline, budget, and cancellation are substrate states, not advisory
- * conventions: a request whose deadline passed is denied before the handler
- * runs; a result that lands late or cancelled is never delivered; a full
- * mailbox sheds or blocks explicitly; every completion state is journaled
- * under the request's xact (spec 13 #9). Enforcement is cooperative — a
- * running handler is never preempted in-process; preemption arrives with
- * the M3 transport boundary.
+ * Response to external review of v1 (20 findings). The enforcement model is
+ * now "hostile same-realm JS code": capabilities and actors are opaque
+ * tokens whose authority state lives in runtime-private WeakMaps, so no
+ * holder-side mutation can forge rights, un-revoke, drop membranes, or
+ * reach a target — in-realm, before any transport boundary. Messages and
+ * results cross principal boundaries by structured clone, never by shared
+ * reference. Deadline/cancel settle the caller-facing outcome via cancel()
+ * and tick() regardless of whether the handler ever returns.
  *
- * The in-process reference substrate for the normative invariants in
- * spec/invariants.md (inherited from agate spec 13; ids preserved). v1 is
- * single-threaded; caller identity is a passed actor reference, not a
- * transport stamp — every deviation from kernel-grade enforcement is flagged
- * inline and tracked in ROADMAP.md.
+ * Still true (documented deviations): handlers are not preempted in-process
+ * (M3 transports); identity is a runtime-branded reference, not an
+ * unforgeable transport stamp (#4, M3); the journal is in-memory and
+ * internally hash-consistent for the process lifetime — external anchoring
+ * and signing are future work (#10 wording in spec/invariants.md).
  */
 
 import { createHash } from "node:crypto";
 
 const sha256 = (v) =>
   createHash("sha256").update(typeof v === "string" ? v : JSON.stringify(v)).digest("hex");
+
+const UNHASHABLE = "!unhashable";
+const BENCH_HASH = () => "!bench";
+
+/* Canonical, total serialization: sorted keys, non-JSON atoms tagged so
+ * {} vs {a:undefined} and NaN vs null never collide; only cycles fail, and
+ * failure is a value (UNHASHABLE), never a throw inside a completion path. */
+function canonicalize(v, seen) {
+  if (v === null) return null;
+  if (v === undefined) return "!undef";
+  const t = typeof v;
+  if (t === "bigint" || t === "function" || t === "symbol") return `!${t}:${String(v)}`;
+  if (t === "number" && !Number.isFinite(v)) return `!num:${String(v)}`;
+  if (t !== "object") return v; // string | number | boolean | undefined
+  if (seen.has(v)) throw new SubstrateError("E_CANON", "cyclic value");
+  seen.add(v);
+  try {
+    if (Array.isArray(v)) return v.map((x) => canonicalize(x, seen));
+    const o = {};
+    for (const k of Object.keys(v).sort()) o[k] = canonicalize(v[k], seen);
+    return o;
+  } finally {
+    seen.delete(v);
+  }
+}
+
+const canonSha = (v) => {
+  try {
+    return sha256(canonicalize(v, new Set()));
+  } catch {
+    return UNHASHABLE;
+  }
+};
 
 export class SubstrateError extends Error {
   constructor(code, msg) {
@@ -34,11 +68,19 @@ export class SubstrateError extends Error {
 
 export class Provenance {
   entries = [];
+  #hash;
+
+  /** A non-conforming sink may swap the hasher (bench); events are still
+   *  generated — only the crypto is replaced, and the Runtime that chose it
+   *  is flagged `conforming: false`. */
+  constructor({ hash = sha256 } = {}) {
+    this.#hash = hash;
+  }
 
   append(event) {
     const seq = this.entries.length;
     const prevHash = this.entries.at(-1)?.hash ?? null;
-    const hash = sha256({ seq, event, prevHash });
+    const hash = this.#hash({ seq, event, prevHash });
     this.entries.push({ seq, event, prevHash, hash });
     return hash;
   }
@@ -47,336 +89,521 @@ export class Provenance {
     let prev = null;
     for (const e of this.entries) {
       if (e.prevHash !== prev) return false;
-      if (sha256({ seq: e.seq, event: e.event, prevHash: prev }) !== e.hash) return false;
+      if (this.#hash({ seq: e.seq, event: e.event, prevHash: prev }) !== e.hash) return false;
       prev = e.hash;
     }
     return true;
   }
 }
 
-/* ---------- Capability: designation + rights, derivable, revocable ----------
- * Invariant (spec 13 #2 monotonic decay): derived rights are always a subset.
- * Invariant (spec 13 #6 revocation reachability): revoke cascades to the
- * whole derivation subtree. */
+const VALID_RIGHTS = new Set(["send", "recv", "grant", "revoke"]);
 
-export class Capability {
-  #children = [];
+/* ---------- Membranes: factories; per-derivation instantiated state ----------
+ * Budget scope is defined explicitly (review #15): a membrane's state
+ * belongs to the grant that attached it and is shared by that cap's whole
+ * derivation subtree; sibling subtrees get independent counters.
+ * Membranes run in attachment order and charge their budget on the
+ * ATTEMPT, before later membranes veto (charged-attempt semantics). */
 
-  constructor(target, rights, { name = null, membranes = [], parent = null } = {}) {
-    this.target = target;
-    this.rights = Object.freeze(new Set(rights));
-    this.name = name;
-    this.membranes = membranes;
-    this.parent = parent;
-    this.revoked = false;
-    if (parent) parent.#children.push(this);
-  }
-
-  get descendants() {
-    return [...this.#children];
-  }
-
-  attenuate({ rights, membranes = [] } = {}) {
-    const next = rights ? [...rights] : [...this.rights];
-    for (const r of next) {
-      if (!this.rights.has(r)) {
-        throw new SubstrateError("E_ATTENUATE", `derivation may not add rights: +${r}`);
+export const rateLimit = (maxCalls) => ({
+  kind: "rateLimit",
+  create: () => {
+    let used = 0;
+    return (ctx) => {
+      if (used >= maxCalls) {
+        throw new SubstrateError("E_BUDGET", `membrane budget exhausted (${maxCalls} calls)`);
       }
-    }
-    return new Capability(this.target, next, {
-      name: this.name,
-      membranes: [...this.membranes, ...membranes],
-      parent: this,
-    });
-  }
+      used += 1;
+      return ctx.args;
+    };
+  },
+});
 
-  revoke() {
-    if (this.revoked) return;
-    this.revoked = true;
-    for (const c of this.#children) c.revoke();
-  }
-}
-
-/* ---------- Membranes: policy layers attached to derived capabilities ----------
- * A membrane sees every mediated call, may rewrite args, and may veto.
- * This is the enforcement point for "policy lives outside the model"
- * (spec 13 #11): an agent holding a badged, membred cap cannot outgrow it. */
-
-export const rateLimit = (maxCalls) => {
-  let used = 0;
-  return (ctx) => {
-    if (used >= maxCalls) {
-      throw new SubstrateError("E_BUDGET", `membrane budget exhausted (${maxCalls} calls)`);
-    }
-    used += 1;
+export const policy = (fn, msg = "rejected by policy") => ({
+  kind: "policy",
+  create: () => (ctx) => {
+    if (!fn(ctx.args)) throw new SubstrateError("E_POLICY", msg);
     return ctx.args;
-  };
-};
+  },
+});
 
-export const policy = (fn, msg = "rejected by policy") => (ctx) => {
-  if (!fn(ctx.args)) throw new SubstrateError("E_POLICY", msg);
-  return ctx.args;
-};
+/* ---------- Actor / Capability: opaque tokens ----------
+ * Holders see a frozen identity-only token. All authority state (rights,
+ * target, membranes, revocation, lineage) lives in runtime WeakMaps keyed
+ * by the token: unforgeable, unenumerable, and unreachable by holder-side
+ * code — including code that enumerates symbols or deep-freezes objects. */
 
-/* ---------- Actor: identity + capability table + bounded mailbox ----------
- * Invariant (spec 13 #1 zero ambient authority): a new actor's capability
- * table is empty; everything arrives by explicit grant.
- * Backpressure is per-actor policy: onFull "shed" rejects the sender with
- * E_SHED, "block" parks the send until recv frees a slot. */
-
-export class Actor {
-  constructor(id, label, { mailbox = 64, onFull = "shed" } = {}) {
-    this.id = id;
-    this.label = label;
-    this.slots = new Map();
-    this.mbox = [];
-    this.mboxCap = mailbox;
-    this.onFull = onFull;
-    this.mboxWaiters = [];
-  }
-
-  hold(slot) {
-    const cap = this.slots.get(slot);
-    if (!cap) {
-      throw new SubstrateError("E_NO_CAP", `actor ${this.id} holds no capability at slot '${slot}'`);
-    }
-    return cap;
-  }
-}
-
-/* ---------- Runtime: the mediating substrate ---------- */
+/* ---------- Runtime ---------- */
 
 export class Runtime {
-  journal = new Provenance();
-  #nextActor = 1;
-  #xact = 0;
-  #msg = 0;
+  journal;
+  conforming = true;
+
   #now;
-  #journaling;
-  #pending = new Map(); // request xact -> { cancelled }
-  #queued = new Map();  // mailbox xact -> { actor, waiter? }
+  #h;
+  #nextActor = 1;
+  #seq = 0;
+  #actors = new WeakMap(); // actor token -> private state
+  #caps = new WeakMap();   // cap token  -> private record
+  #pending = new Map();    // request xact -> request record
+  #queued = new Map();     // message xact -> { st, kind: "mbox" | "waiter", ... }
 
-  /** `journal:false` is a measurement seam only (docs/evaluation.md tier 1:
-   *  "journal on/off"); every other substrate decision is unaffected. */
-  constructor({ now = () => globalThis.performance.now(), journal = true } = {}) {
+  /** `bench: true` selects a non-conforming, constant-time audit sink for
+   *  cost-model fitting only; it is reported on `rt.conforming`, never
+   *  silently off. There is no way to disable the journal itself. */
+  constructor({ now = () => globalThis.performance.now(), bench = false } = {}) {
     this.#now = now;
-    this.#journaling = journal;
+    this.#h = bench ? BENCH_HASH : canonSha;
+    if (bench) this.conforming = false;
+    this.journal = new Provenance({ hash: bench ? BENCH_HASH : sha256 });
   }
 
-  #append(event) {
-    if (this.#journaling) this.journal.append(event);
+  #A(token) {
+    const st = this.#actors.get(token);
+    if (!st) throw new SubstrateError("E_FOREIGN", "actor is not owned by this runtime");
+    return st;
   }
 
-  #nowMs() {
-    return this.#now();
+  #C(token) {
+    const rec = this.#caps.get(token);
+    if (!rec) throw new SubstrateError("E_FOREIGN", "capability is not minted by this runtime");
+    return rec;
   }
 
-  spawn(label, opts = {}) {
-    const a = new Actor(this.#nextActor++, label ?? null, opts);
-    this.#append({ t: "spawn", actor: a.id, label: a.label });
-    return a;
+  #mint(rec) {
+    const token = Object.freeze({ id: `c${++this.#seq}` });
+    this.#caps.set(token, { children: [], revoked: false, instances: [], ...rec });
+    return token;
   }
+
+  /* ===== actors ===== */
+
+  spawn(label, { mailbox = 64, onFull = "shed" } = {}) {
+    if (onFull !== "shed" && onFull !== "block") {
+      throw new SubstrateError("E_INVAL", "onFull: shed|block");
+    }
+    const token = Object.freeze({ id: this.#nextActor++, label: label ?? null });
+    this.#actors.set(token, {
+      token,
+      slots: new Map(),
+      mbox: [],
+      waiters: [],
+      mboxCap: mailbox,
+      waiterCap: mailbox * 4,
+      onFull,
+      mboxCapToken: null,
+    });
+    this.journal.append({ t: "spawn", actor: token.id, label: token.label });
+    return token;
+  }
+
+  /** Root capability over an actor's mailbox. Distributing it is the ONLY
+   *  way to grant anyone (including other runtimes' notions of "public
+   *  address") the right to tell() that actor — messaging is mediated
+   *  (invariant #3). The root itself is not ambient: it lives with whoever
+   *  the system hands it to, and attenuates/revokes like any cap. */
+  address(actorToken) {
+    const st = this.#A(actorToken);
+    if (!st.mboxCapToken) {
+      st.mboxCapToken = this.#mint({
+        kind: "actor",
+        target: actorToken,
+        name: `mailbox:${actorToken.id}`,
+        rights: new Set(["send", "recv", "grant", "revoke"]),
+      });
+    }
+    return st.mboxCapToken;
+  }
+
+  holds(actorToken, slot) {
+    const st = this.#A(actorToken);
+    const tok = st.slots.get(slot);
+    if (!tok) throw new SubstrateError("E_NO_CAP", `actor ${actorToken.id} holds no capability at slot '${slot}'`);
+    return tok;
+  }
+
+  rightsOf(capToken) {
+    return Object.freeze([...this.#C(capToken).rights]);
+  }
+
+  isRevoked(capToken) {
+    return this.#C(capToken).revoked;
+  }
+
+  /* ===== capabilities ===== */
 
   endpoint(name, handler, { rights = ["send", "recv", "grant", "revoke"] } = {}) {
-    return new Capability({ kind: "endpoint", name, handler }, rights, { name });
+    for (const r of rights) if (!VALID_RIGHTS.has(r)) throw new SubstrateError("E_INVAL", `unknown right '${r}'`);
+    return this.#mint({ kind: "endpoint", target: { handler }, name: String(name), rights: new Set(rights) });
   }
 
-  /** Create a tool service actor that holds the root capability. */
   serve(label, name, handler) {
     const server = this.spawn(label);
     const cap = this.endpoint(name, handler);
-    server.slots.set(name, cap);
+    this.#A(server).slots.set(name, cap);
     return { server, cap };
   }
 
-  /** Explicit delegation. Never adds rights; attenuation and membranes attach here. */
-  grant(from, fromSlot, to, toSlot, { rights, membranes } = {}) {
-    const src = from.hold(fromSlot);
-    const derived = src.attenuate({ rights, membranes });
-    to.slots.set(toSlot, derived);
-    this.#append({
-      t: "grant",
-      from: from.id,
-      to: to.id,
-      tool: src.name,
-      slot: toSlot,
-      rights: [...derived.rights],
-    });
-    return derived;
-  }
-
-  revoke(cap) {
-    cap.revoke();
-    this.#append({ t: "revoke", tool: cap.name });
-  }
-
-  /** Mediated call, admitted under explicit lifecycle states. Returns
-   *  { xact, promise }. Denials carry the same xact as successes would,
-   *  so the journal correlates attempt and outcome (spec 13 #10). */
-  request(actor, slot, args, { deadline = null, signal = null } = {}) {
-    const xact = `x${++this.#xact}`;
-    const cap = actor.hold(slot);
-    const deny = (code, msg) => {
-      this.#append({ t: "invoke_denied", xact, actor: actor.id, tool: cap.name, code });
-      throw new SubstrateError(code, msg);
-    };
-    if (cap.revoked) deny("E_REVOKED", `capability '${cap.name}' is revoked`);
-    if (!cap.rights.has("send")) deny("E_RIGHTS", "missing 'send' right");
-    if (signal?.aborted) deny("E_CANCELLED", "cancelled before admission");
-    if (deadline !== null && this.#nowMs() >= deadline) {
-      deny("E_DEADLINE", "deadline passed before admission; handler not executed");
-    }
-
-    let ctx = { actor, cap, args, xact };
+  /** Derive a child capability from an actor's slot and install it on `to`. */
+  grant(from, fromSlot, to, toSlot, opts = {}) {
+    let srcTok;
     try {
-      for (const m of cap.membranes) {
-        const next = m(ctx);
-        if (next !== undefined) ctx = { ...ctx, args: next };
-      }
+      srcTok = this.#A(from).slots.get(fromSlot);
     } catch (e) {
-      this.#append({ t: "invoke_denied", xact, actor: actor.id, tool: cap.name, code: e.code ?? "E_MEMBRANE" });
+      this.#grantDenied(from, to, toSlot, `x${this.#seq}`, e.code ?? "E_FOREIGN");
       throw e;
     }
+    if (!srcTok) {
+      this.#grantDenied(from, to, toSlot, `x${this.#seq}`, "E_NO_CAP");
+      throw new SubstrateError("E_NO_CAP", "source slot empty");
+    }
+    return this.grantCap(srcTok, to, toSlot, opts);
+  }
 
-    // hashing is journal work: when the measurement seam turns the journal
-    // off, its cost must leave the measurement too (docs/evaluation.md tier 1)
-    const argsHash = this.#journaling ? sha256(ctx.args) : null;
-    const journalEv = (outcome, result) => {
-      if (!this.#journaling) return;
-      const ev = { t: "invoke", xact, actor: actor.id, tool: cap.name, outcome, argsHash };
-      if (result !== undefined) ev.resultHash = sha256(result);
-      this.journal.append(ev);
+  #grantDenied(from, to, toSlot, gx, code) {
+    this.journal.append({
+      t: "grant_denied", xact: gx, from: from?.id ?? null, to: to?.id ?? null, slot: toSlot, code,
+    });
+  }
+
+  /** Derive from a capability token directly — the distribution path for
+   *  root mailbox caps from `address()`, which live outside any slot table
+   *  (zero ambient authority, #1, stays literally true). Authority checks
+   *  are identical either way. */
+  grantCap(srcTok, to, toSlot, { rights, membranes = [] } = {}) {
+    const gx = `x${++this.#seq}`;
+    let srcId = null;
+    try {
+      srcId = this.#C(srcTok).target?.id ?? null;
+    } catch {}
+    const deny = (code, msg) => {
+      this.#grantDenied(srcId, to, toSlot, gx, code);
+      throw new SubstrateError(code, msg);
     };
+    let toSt;
+    try {
+      toSt = this.#A(to);
+    } catch (e) {
+      deny(e.code, e.message);
+    }
+    const src = this.#C(srcTok);
+    if (src.revoked) deny("E_REVOKED", "source capability is revoked");
+    if (!src.rights.has("grant")) deny("E_RIGHTS", "delegation requires the 'grant' right");
+    const next = rights ? [...rights] : [...src.rights];
+    for (const r of next) {
+      if (!VALID_RIGHTS.has(r)) deny("E_INVAL", `unknown right '${r}'`);
+      if (!src.rights.has(r)) deny("E_ATTENUATE", `derivation may not add rights: +${r}`);
+    }
+    let created;
+    try {
+      created = membranes.map((m) => m.create());
+    } catch {
+      deny("E_INVAL", "bad membrane factory");
+    }
+    const child = this.#mint({
+      kind: src.kind,
+      target: src.target,
+      name: src.name,
+      rights: new Set(next),
+      parent: srcTok,
+      instances: [...src.instances, ...created],
+    });
+    src.children.push(child);
+    toSt.slots.set(toSlot, child);
+    this.journal.append({
+      t: "grant", xact: gx, to: to.id, tool: src.name, slot: toSlot, rights: next,
+    });
+    return child;
+  }
 
-    const rec = { cancelled: false };
-    this.#pending.set(xact, rec);
-    if (signal) signal.addEventListener("abort", () => this.cancel(xact), { once: true });
+  revoke(capToken) {
+    const root = this.#C(capToken);
+    const queue = [root];
+    while (queue.length) {
+      const rec = queue.pop();
+      if (rec.revoked) continue;
+      rec.revoked = true;
+      for (const childTok of rec.children) queue.push(this.#C(childTok));
+    }
+    this.journal.append({ t: "revoke", tool: root.name });
+  }
+
+  /* ===== mediated invocation ===== */
+
+  request(actor, slot, args, { deadline = null, signal = null } = {}) {
+    const x = `x${++this.#seq}`;
+    const deny = (code, msg) => {
+      this.journal.append({ t: "invoke_denied", xact: x, actor: actor?.id ?? null, slot, code });
+      throw new SubstrateError(code, msg);
+    };
+    let st;
+    try {
+      st = this.#A(actor);
+    } catch {
+      deny("E_FOREIGN", "actor not owned by this runtime");
+    }
+    const capTok = st.slots.get(slot);
+    if (!capTok) deny("E_NO_CAP", `no capability at slot '${slot}'`);
+    const rec = this.#C(capTok);
+    if (rec.revoked) deny("E_REVOKED", `capability '${rec.name}' is revoked`);
+    if (!rec.rights.has("send")) deny("E_RIGHTS", "missing 'send' right");
+    if (signal?.aborted) deny("E_CANCELLED", "cancelled before admission");
+    if (deadline !== null && this.#now() >= deadline) {
+      deny("E_DEADLINE", "deadline passed before admission; handler not executed");
+    }
+    let margs = args;
+    const frozenCtx = Object.freeze({
+      xact: x,
+      caller: Object.freeze({ id: actor.id, label: actor.label }),
+      tool: rec.name,
+    });
+    for (const inst of rec.instances) {
+      let out;
+      try {
+        out = inst(Object.freeze({ ...frozenCtx, args: margs }));
+      } catch (e) {
+        this.journal.append({ t: "invoke_denied", xact: x, actor: actor.id, slot, code: e.code ?? "E_MEMBRANE" });
+        throw e;
+      }
+      if (out !== undefined) margs = out;
+    }
+    const argsHash = this.#h(margs);
+    if (argsHash === UNHASHABLE) deny("E_CANON", "arguments are not canonically hashable (cycle?)");
 
     let resolve_, reject_;
     const promise = new Promise((res, rej) => { resolve_ = res; reject_ = rej; });
+    const r = {
+      x: x, actorId: actor.id, tool: rec.name, argsHash, deadline,
+      settled: false, handlerSettled: false,
+      resolve: resolve_, reject: reject_, promise,
+    };
+    this.#pending.set(x, r);
+    if (signal) signal.addEventListener("abort", () => this.cancel(x), { once: true });
+
+    const settle = (outcome, err, resultHash) => {
+      if (r.settled) return;
+      r.settled = true;
+      this.#pending.delete(x);
+      const ev = { t: "invoke", xact: x, actor: r.actorId, tool: r.tool, outcome, argsHash: r.argsHash };
+      if (resultHash) ev.resultHash = resultHash;
+      this.journal.append(ev);
+    };
 
     let h;
     try {
-      h = cap.target.handler(ctx.args, ctx);
+      h = rec.target.handler(margs, frozenCtx);
     } catch (err) {
-      this.#pending.delete(xact);
-      journalEv("fail");
+      settle("fail");
       throw err;
     }
-
     Promise.resolve(h).then(
       (result) => {
-        this.#pending.delete(xact);
-        if (rec.cancelled) {
-          journalEv("cancelled");
-          reject_(new SubstrateError("E_CANCELLED", `xact ${xact} cancelled; result discarded`));
-        } else if (deadline !== null && this.#nowMs() > deadline) {
-          journalEv("timeout");
-          reject_(new SubstrateError("E_TIMEOUT", `xact ${xact} completed past deadline; result not delivered`));
-        } else {
-          journalEv("ok", result);
-          resolve_(result);
+        r.handlerSettled = true;
+        if (r.settled) {
+          this.journal.append({ t: "handler_settled", xact: x });
+          return;
         }
+        if (r.deadline !== null && this.#now() > r.deadline) {
+          settle("timeout");
+          r.reject(new SubstrateError("E_TIMEOUT", `xact ${x} completed past deadline; result not delivered`));
+          return;
+        }
+        let delivered = result;
+        let rh;
+        try {
+          delivered = structuredClone(result);
+        } catch {
+          // result cannot cross a real boundary either; keep identity, flag it
+          delivered = result;
+          rh = UNHASHABLE;
+        }
+        if (rh === undefined) rh = this.#h(delivered);
+        settle("ok", null, rh);
+        r.resolve(delivered);
       },
       (err) => {
-        this.#pending.delete(xact);
-        journalEv(rec.cancelled ? "cancelled" : "fail");
-        reject_(err);
+        r.handlerSettled = true;
+        if (r.settled) {
+          this.journal.append({ t: "handler_settled", xact: x });
+          return;
+        }
+        settle("fail");
+        r.reject(err);
       }
     );
 
-    return { xact, promise };
+    return { xact: x, promise };
   }
 
-  /** Convenience over request(); throws/rejects with the substrate code. */
   async invoke(actor, slot, args, opts = {}) {
     return this.request(actor, slot, args, opts).promise;
   }
 
-  /** Cancel by xact id. A pending request never delivers its result (the
-   *  handler is not preempted — its output is discarded and journaled); a
-   *  queued or blocked message is removed before delivery. */
+  /** Scheduler tick: settles caller-facing outcomes for expired requests and
+   *  expired queue entries no matter what the handler does afterwards. Hosts
+   *  drive this periodically (or after any clock advance). #9 completion is
+   *  guaranteed by cancel()/tick(), not by handler cooperation. */
+  tick(now = this.#now()) {
+    for (const [x, r] of [...this.#pending]) {
+      if (!r.settled && r.deadline !== null && now >= r.deadline) {
+        r.settled = true;
+        this.#pending.delete(x);
+        this.journal.append({ t: "invoke", xact: x, actor: r.actorId, tool: r.tool, outcome: "timeout", argsHash: r.argsHash });
+        r.reject(new SubstrateError("E_TIMEOUT", `xact ${x} deadline enforced by tick`));
+      }
+    }
+    const touched = new Set();
+    for (const [x, q] of [...this.#queued]) {
+      const deadline = q.kind === "mbox" ? q.msg.deadline : q.waiter.deadline;
+      if (deadline === null || now < deadline) continue;
+      this.#removeQueued(x, q);
+      touched.add(q.st);
+      this.journal.append({ t: "expire", xact: x, actor: q.st.token.id });
+      if (q.kind === "waiter") q.waiter.resolve({ ok: false, reason: "expired" });
+    }
+    for (const st of touched) this.#drain(st);
+  }
+
+  /** Cancel by xact id. For requests: the caller is rejected NOW and the
+   *  ledger records delivery cancellation; when a (non-preempted) handler
+   *  eventually settles, a separate `handler_settled` fact is appended —
+   *  cancellation cancels DELIVERY, and the journal never claims otherwise. */
   cancel(xact) {
-    const req = this.#pending.get(xact);
-    if (req) {
-      req.cancelled = true;
-      this.#append({ t: "cancel", xact });
+    const r = this.#pending.get(xact);
+    if (r) {
+      this.journal.append({ t: "cancel", xact });
+      if (!r.settled) {
+        r.settled = true;
+        this.#pending.delete(xact);
+        this.journal.append({ t: "invoke", xact, actor: r.actorId, tool: r.tool, outcome: "cancelled", argsHash: r.argsHash, delivery: "cancelled" });
+        r.reject(new SubstrateError("E_CANCELLED", `xact ${xact} cancelled; result delivery stopped`));
+      }
       return true;
     }
     const q = this.#queued.get(xact);
-    if (!q) return false;
-    this.#queued.delete(xact);
-    this.#append({ t: "cancel", xact });
-    if (q.waiter) {
-      const i = q.actor.mboxWaiters.indexOf(q.waiter);
-      if (i >= 0) q.actor.mboxWaiters.splice(i, 1);
-      q.waiter.reject(new SubstrateError("E_CANCELLED", `blocked message ${xact} cancelled`));
-    } else {
-      const i = q.actor.mbox.findIndex((m) => m.xact === xact);
-      if (i >= 0) q.actor.mbox.splice(i, 1);
+    if (q) {
+      this.#removeQueued(xact, q);
+      this.journal.append({ t: "cancel", xact });
+      if (q.kind === "waiter") q.waiter.resolve({ ok: false, reason: "cancelled" });
+      this.#drain(q.st);
+      return true;
     }
-    return true;
+    return false;
   }
 
-  /** Sender stamping + backpressure. `sender` is bound by the runtime from
-   *  the caller reference and is never read from message content (spec 13
-   *  #4; the kernel version replaces the reference with an EL0-unforgeable
-   *  stamp). Returns true when enqueued, a Promise when the full mailbox
-   *  blocks, and throws E_SHED when the actor sheds. Queued messages are
-   *  checked for expiry at delivery, not at send. */
+  #removeQueued(x, q) {
+    this.#queued.delete(x);
+    if (q.kind === "mbox") {
+      const i = q.st.mbox.findIndex((m) => m.xact === x);
+      if (i >= 0) q.st.mbox.splice(i, 1);
+    } else {
+      const i = q.st.waiters.indexOf(q.waiter);
+      if (i >= 0) q.st.waiters.splice(i, 1);
+    }
+  }
+
+  /* ===== mediated messaging =====
+   * tell() requires a capability (right "send") whose target is `to` —
+   * possession of an actor reference is NOT authority to spam it (#3).
+   * Values cross by structured clone both ways; a blocked send NEVER
+   * rejects: it resolves {ok:true} on delivery or {ok:false, reason} on
+   * expiry/cancellation, so ignored results cannot become process-wide
+   * unhandled rejections. */
+
   tell(from, to, msg, { deadline = null, xact = null } = {}) {
-    xact = xact ?? `m${++this.#msg}`;
-    if (to.mbox.length >= to.mboxCap) {
-      if (to.onFull === "block") {
+    if (xact !== null) {
+      if (this.#pending.has(xact) || this.#queued.has(xact)) {
+        this.journal.append({ t: "deliver_denied", xact, from: from?.id ?? null, to: to?.id ?? null, code: "E_INVAL" });
+        throw new SubstrateError("E_INVAL", `xact '${xact}' collides with a live transaction`);
+      }
+    } else {
+      xact = `t${++this.#seq}`;
+      while (this.#queued.has(xact)) xact = `t${++this.#seq}`;
+    }
+    const deny = (code, msg) => {
+      this.journal.append({ t: "deliver_denied", xact, from: from?.id ?? null, to: to?.id ?? null, code });
+      throw new SubstrateError(code, msg);
+    };
+    let fs, ts;
+    try {
+      fs = this.#A(from);
+      ts = this.#A(to);
+    } catch {
+      deny("E_FOREIGN", "actor not owned by this runtime");
+    }
+    let canSend = false;
+    for (const tok of fs.slots.values()) {
+      const rec = this.#C(tok);
+      if (rec.kind === "actor" && rec.target === to && !rec.revoked && rec.rights.has("send")) {
+        canSend = true;
+        break;
+      }
+    }
+    if (!canSend) deny("E_RIGHTS", `no send capability for actor ${to.id}`);
+    let cloned;
+    try {
+      cloned = structuredClone(msg);
+    } catch {
+      deny("E_CANON", "message is not structurally cloneable");
+    }
+    if (ts.waiters.length >= ts.waiterCap) {
+      this.journal.append({ t: "shed", xact, from: from.id, to: to.id, why: "waiters" });
+      throw new SubstrateError("E_SHED", `mailbox of '${to.label ?? to.id}' shed (waiter bound)`);
+    }
+    if (ts.mbox.length >= ts.mboxCap) {
+      if (ts.onFull === "block") {
         let w;
-        const p = new Promise((resolve, reject) => {
-          w = { sender: from.id, msg, deadline, xact, resolve, reject };
+        const p = new Promise((resolve) => {
+          w = { sender: from.id, msg: cloned, xact, deadline, resolve };
         });
-        to.mboxWaiters.push(w);
-        this.#queued.set(xact, { actor: to, waiter: w });
-        this.#append({ t: "tell_blocked", xact, from: from.id, to: to.id });
+        ts.waiters.push(w);
+        this.#queued.set(xact, { st: ts, kind: "waiter", waiter: w });
+        this.journal.append({ t: "tell_blocked", xact, from: from.id, to: to.id });
         return p;
       }
-      this.#append({ t: "shed", xact, from: from.id, to: to.id });
-      throw new SubstrateError("E_SHED", `mailbox of '${to.label ?? to.id}' is full (${to.mboxCap})`);
+      this.journal.append({ t: "shed", xact, from: from.id, to: to.id });
+      throw new SubstrateError("E_SHED", `mailbox of '${to.label ?? to.id}' is full (${ts.mboxCap})`);
     }
-    to.mbox.push({ sender: from.id, msg, xact, deadline });
-    this.#queued.set(xact, { actor: to });
-    this.#append({ t: "tell", xact, from: from.id, to: to.id });
+    ts.mbox.push({ sender: from.id, msg: cloned, xact, deadline });
+    this.#queued.set(xact, { st: ts, kind: "mbox", msg: { xact, deadline } });
+    this.journal.append({ t: "tell", xact, from: from.id, to: to.id });
     return true;
   }
 
   recv(actor) {
-    while (actor.mbox.length) {
-      const m = actor.mbox[0];
-      if (m.deadline !== null && this.#nowMs() >= m.deadline) {
-        actor.mbox.shift();
+    const st = this.#A(actor);
+    let out = null;
+    while (st.mbox.length) {
+      const m = st.mbox[0];
+      if (m.deadline !== null && this.#now() >= m.deadline) {
+        st.mbox.shift();
         this.#queued.delete(m.xact);
-        this.#append({ t: "expire", xact: m.xact, actor: actor.id });
+        this.journal.append({ t: "expire", xact: m.xact, actor: actor.id });
         continue;
       }
-      actor.mbox.shift();
+      st.mbox.shift();
       this.#queued.delete(m.xact);
-      this.#append({ t: "recv", actor: actor.id, sender: m.sender, xact: m.xact });
-      this.#drainWaiters(actor);
-      return m;
+      this.journal.append({ t: "recv", actor: actor.id, sender: m.sender, xact: m.xact });
+      out = { sender: m.sender, msg: m.msg, xact: m.xact };
+      break;
     }
-    return null;
+    this.#drain(st); // EVERY capacity-freeing transition promotes waiters
+    return out;
   }
 
-  #drainWaiters(actor) {
-    while (actor.mboxWaiters.length && actor.mbox.length < actor.mboxCap) {
-      const w = actor.mboxWaiters.shift();
+  #drain(st) {
+    while (st.waiters.length && st.mbox.length < st.mboxCap) {
+      const w = st.waiters.shift();
       this.#queued.delete(w.xact);
-      if (w.deadline !== null && this.#nowMs() >= w.deadline) {
-        this.#append({ t: "expire", xact: w.xact, actor: actor.id });
-        w.reject(new SubstrateError("E_DEADLINE", `blocked message ${w.xact} expired`));
+      if (w.deadline !== null && this.#now() >= w.deadline) {
+        this.journal.append({ t: "expire", xact: w.xact, actor: st.token.id });
+        w.resolve({ ok: false, reason: "expired" });
         continue;
       }
-      actor.mbox.push({ sender: w.sender, msg: w.msg, xact: w.xact, deadline: w.deadline });
-      this.#queued.set(w.xact, { actor });
-      this.#append({ t: "tell", xact: w.xact, from: w.sender, to: actor.id, unblocked: true });
-      w.resolve(true);
+      st.mbox.push({ sender: w.sender, msg: w.msg, xact: w.xact, deadline: w.deadline });
+      this.#queued.set(w.xact, { st, kind: "mbox", msg: { xact: w.xact, deadline: w.deadline } });
+      this.journal.append({ t: "tell", xact: w.xact, from: w.sender, to: st.token.id, unblocked: true });
+      w.resolve({ ok: true });
     }
   }
 }

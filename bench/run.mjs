@@ -3,9 +3,16 @@
  *
  * Tier 1 fits the per-invoke cost model coefficients (c_cap, c_journal,
  * c_mem, c_ipc); tier 2 runs whole agent-workload shapes. Aggregation per
- * charter §3: REPS runs per variant, first dropped as warmup, median/max
- * reported; ns/call (a total) uses arithmetic statistics, never a mean of
- * mixed ratios.
+ * charter §3: 11 reps per variant, rep 1 discarded as warmup, 10 measured
+ * reps; totals (ns/call) use the arithmetic mean, medians are reported for
+ * spread; every journal-vs-nojournal comparison is PAIRED (identical
+ * workloads, differing only in the audit sink) and variants are interleaved
+ * to fight drift. Memory cost is reported as journal bytes retained per
+ * mediated call (deep-size estimate, not process RSS).
+ *
+ * The no-journal side is the explicitly non-conforming `bench: true` sink
+ * (constant-time hashing, events still generated): rt.conforming === false.
+ * There is no journal:false seam anymore (review F7).
  *
  * Run: node bench/run.mjs          (markdown to stdout)
  *      node bench/run.mjs json     (machine-readable)
@@ -14,13 +21,14 @@
 import os from "node:os";
 import { Runtime, policy } from "../src/runtime.js";
 
-const REPS = 10;      // runs per variant (charter: >= 10 after warmup)
-const N = 5000;       // mediated calls per run
+const WARMUP = 1;
+const REPS = WARMUP + 10; // charter: >= 10 measured reps after warmup
+const N = 5000; // mediated calls per run
 const args = Object.freeze({ q: "bench" });
 const noop = policy(() => true);
 
 function stats(samples) {
-  const s = [...samples.slice(1)].sort((a, b) => a - b); // drop warmup rep
+  const s = [...samples.slice(WARMUP)].sort((a, b) => a - b); // drop warmup rep(s)
   const mean = s.reduce((x, y) => x + y, 0) / s.length;
   return {
     mean: +mean.toFixed(1),
@@ -33,24 +41,26 @@ function stats(samples) {
 
 async function timed(fn, opsPerIter = 1, n = N) {
   const out = [];
-  const dts = [];
   for (let r = 0; r < REPS; r++) {
     const t0 = performance.now();
     await fn(n);
     const dt = performance.now() - t0;
-    dts.push(+dt.toFixed(2));
     out.push((dt * 1e6) / (n * opsPerIter)); // ns per op
   }
-  return { ...stats(out), dtMs: dts };
+  return stats(out);
 }
 
 function makeRt({ journal = true, membranes = [] } = {}) {
-  const rt = new Runtime({ journal });
+  const rt = new Runtime({ bench: !journal });
   const { server } = rt.serve("svc", "t", async () => "ok");
   const client = rt.spawn("client");
   rt.grant(server, "t", client, "t", { rights: ["send"], membranes });
   return { rt, client };
 }
+
+const loop = (rt, client, n) => async () => {
+  for (let i = 0; i < n; i++) await rt.invoke(client, "t", args);
+};
 
 /* ---- tier 1: cost-model coefficients ---- */
 
@@ -61,29 +71,33 @@ const tier1 = {
       const h = async () => "ok";
       for (let i = 0; i < n; i++) await h(args);
     }),
-  cap_nojournal: () => {
-    const { rt, client } = makeRt({ journal: false });
-    return timed((n) => (async () => { for (let i = 0; i < n; i++) await rt.invoke(client, "t", args); })());
-  },
   cap_journal: () => {
     const { rt, client } = makeRt();
-    return timed((n) => (async () => { for (let i = 0; i < n; i++) await rt.invoke(client, "t", args); })());
+    return timed(loop(rt, client, N));
+  },
+  cap_bench: () => {
+    const { rt, client } = makeRt({ journal: false });
+    return timed(loop(rt, client, N));
   },
   journal_m1: () => {
     const { rt, client } = makeRt({ membranes: [noop] });
-    return timed((n) => (async () => { for (let i = 0; i < n; i++) await rt.invoke(client, "t", args); })());
+    return timed(loop(rt, client, N));
   },
   journal_m3: () => {
     const { rt, client } = makeRt({ membranes: [noop, noop, noop] });
-    return timed((n) => (async () => { for (let i = 0; i < n; i++) await rt.invoke(client, "t", args); })());
+    return timed(loop(rt, client, N));
   },
-  // tell+recv roundtrip: c_ipc
+  // tell+recv roundtrip: c_ipc. Messaging is mediated (F1a): the sender
+  // needs an attenuated mailbox capability for the target.
   ipc: () => {
-    const { rt } = makeRt();
-    const a = rt.spawn("a");
+    const { rt, client } = makeRt();
     const b = rt.spawn("b", { mailbox: N + 8 });
+    rt.grantCap(rt.address(b), client, "mb", { rights: ["send"] });
     return timed((n) => (async () => {
-      for (let i = 0; i < n; i++) { rt.tell(a, b, args); rt.recv(b); }
+      for (let i = 0; i < n; i++) {
+        rt.tell(client, b, args);
+        rt.recv(b);
+      }
     })());
   },
   // capability derivation (grant): c_derive
@@ -103,22 +117,35 @@ const tier1 = {
 
 /* ---- tier 2: whole-workload shapes ---- */
 
+const toolLoop = (journal) => () => {
+  const { rt, client } = makeRt({ journal, membranes: [noop] });
+  return timed(loop(rt, client, N));
+};
+
 const tier2 = {
-  // tool loop: K sequential mediated invokes, one membrane
-  tool_loop: () => {
-    const { rt, client } = makeRt({ membranes: [noop] });
-    return timed((n) => (async () => { for (let i = 0; i < n; i++) await rt.invoke(client, "t", args); })());
-  },
-  // fan-out: one planner mails 8 workers per cycle, workers reply
-  // (reported per message: each cycle moves 32 messages)
+  // paired tool loops: identical workload, only the audit sink differs
+  tool_loop_journal: toolLoop(true),
+  tool_loop_bench: toolLoop(false),
+  // fan-out: planner mails 8 workers, each replies. One cycle moves
+  // 16 messages = 32 queue operations; reported PER QUEUE OP (F18:
+  // per-message cost is 2x this figure).
   fanout: () => {
-    const { rt } = makeRt({ journal: false });
+    const { rt, client } = makeRt({ journal: false });
     const planner = rt.spawn("planner");
     const workers = Array.from({ length: 8 }, (_, i) => rt.spawn(`w${i}`));
+    const addr = rt.address(planner);
+    workers.forEach((w, i) => {
+      rt.grantCap(addr, w, "p", { rights: ["send"] }); // worker -> planner
+      rt.grantCap(rt.address(w), planner, `w${i}`, { rights: ["send"] }); // planner -> worker (distinct slot per target)
+    });
+    void client;
     return timed((n) => (async () => {
       for (let i = 0; i < n; i++) {
         for (const w of workers) rt.tell(planner, w, args);
-        for (const w of workers) { rt.recv(w); rt.tell(w, planner, args); }
+        for (const w of workers) {
+          rt.recv(w);
+          rt.tell(w, planner, args);
+        }
         for (const _ of workers) rt.recv(planner);
       }
     })(), 32);
@@ -140,11 +167,47 @@ const tier2 = {
   },
 };
 
+/* ---- memory: journal bytes retained per mediated call ---- */
+
+function deepSize(v, seen = new Set()) {
+  if (v === null || typeof v !== "object") {
+    if (typeof v === "string") return 2 * v.length + 16;
+    return typeof v === "number" || typeof v === "boolean" ? 8 : 0;
+  }
+  if (seen.has(v)) return 0;
+  seen.add(v);
+  let s = 64; // object header/slots estimate
+  if (Array.isArray(v)) for (const x of v) s += deepSize(x, seen);
+  else for (const k of Object.keys(v)) s += 2 * k.length + 8 + deepSize(v[k], seen);
+  return s;
+}
+
+async function memCost() {
+  const { rt, client } = makeRt();
+  const before = deepSize(rt.journal.entries);
+  for (let i = 0; i < N; i++) await rt.invoke(client, "t", args);
+  const after = deepSize(rt.journal.entries);
+  return { bytesPerCall: +((after - before) / N).toFixed(1), entries: rt.journal.entries.length };
+}
+
 export async function run(which = "all") {
   const groups = {};
-  if (which === "all" || which === "1") groups.tier1 = await runAll(tier1);
-  else if (which === "2") groups.tier2 = await runAll(tier2);
-  else {
+  if (which === "all" || which === "1" || which === "2") {
+    const variants = { ...tier1, ...tier2 };
+    const names =
+      which === "1" ? Object.keys(tier1) : which === "2" ? Object.keys(tier2) : Object.keys(variants);
+    // interleave two passes so paired variants also swap order (drift control)
+    const order = names.concat([...names].reverse());
+    groups.paired = {};
+    for (const name of order) {
+      const s = await variants[name]();
+      const prev = groups.paired[name];
+      groups.paired[name] = prev
+        ? { pass1: prev, pass2: s, best_ns: Math.min(prev.median, s.median) }
+        : s;
+    }
+    groups.memory = await memCost();
+  } else {
     const names = which.split(",");
     const pick = (map) =>
       Object.fromEntries(Object.entries(map).filter(([k]) => names.includes(k)));
@@ -175,18 +238,19 @@ function envMeta() {
     node: p?.version ?? "(embedded repl)",
     os: p ? `${p.platform} ${os.release()}` : "?",
     cpu: os.cpus()[0].model.trim(),
-    reps: REPS,
+    logicalCpus: os.cpus().length,
+    warmupReps: WARMUP,
+    measuredReps: REPS - WARMUP,
     n: N,
   };
 }
 
 function renderMarkdown(groups, env) {
-  let md = `| variant | mean ns | median ns | max ns |\n|---|---|---|---|\n`;
-  for (const [tier, rows] of Object.entries(groups)) {
-    md += `| _${tier}_ | | | |\n`;
-    for (const [name, s] of Object.entries(rows)) {
-      md += `| ${name} | ${s.mean} | ${s.median} | ${s.max} |\n`;
-    }
+  let md = `| variant | mean ns | median ns | min ns | max ns |\n|---|---|---|---|---|\n`;
+  for (const [name, s] of Object.entries(groups.paired ?? {})) {
+    const rep = s.pass2 ?? s;
+    md += `| ${name} | ${rep.mean} | ${rep.median} | ${rep.min} | ${rep.max} |\n`;
   }
+  if (groups.memory) md += `\njournal memory: ~${groups.memory.bytesPerCall} B retained per mediated invoke\n`;
   return md + `\nenv: ${JSON.stringify(env)}\n`;
 }
