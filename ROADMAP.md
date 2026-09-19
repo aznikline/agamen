@@ -58,7 +58,7 @@ provable against each other. The negative gate is the milestone:
 `complete()` refuses without at least one evidence item backed by a
 journaled `ok` invocation. Acceptance: 13 lifecycle + negative tests.
 
-## S2 — APM as normative spec (rev. S2.0.2, `spec/apm.md`)
+## S2 — APM as normative spec (rev. S2.0.3, `spec/apm.md`)
 
 The spec stands on its own, independent of the JavaScript prototype. It
 is built on three separations — **Ownership is not authority. Evidence
@@ -128,22 +128,40 @@ precedes the linearization point. Landed alongside: `receipt`
 obligations at open/fork/delegate, append-only `amend` (bumps
 `contractRevision`); non-null `matcher` REFUSED until matcher semantics
 land; `handoff` bumps `ownerEpoch`; `complete()` claims only SELECT.
-22/22 APM + 51/51 invariant tests. Honest labels: CO-1 is **[partial]**
-— the contract array is still publicly mutable; ST-3 (widened to
-state/contract/revisions/epoch/envelope/evidence/spent) is what turns
-"append-only" from convention into property. Next, in spec order:
-ST-3 → ST-2 → the COMPLETING skeleton (ST-1 + four kinds + matcher) →
-DC-5 — no check runs against mutable truth, no fourth oracle. Shape
-guidance for those two slices: ST-3 is ONE private state record behind
-a read-only intent view (state, stateVersion, contract,
-contractRevision, ownerEpoch, envelope, evidence, spent — all mutation
-only through `AgentSystem`), not a field-by-field `#private` sprinkle;
-ST-2 collapses every state change into ONE `transition(intent,
-toState, cause)` primitive that atomically journalls
-`{intent, fromState, toState, stateVersion, cause}` and checks
-`fromState == current` and `nextVersion == current + 1` — so by the
-time COMPLETING/DC-5 land, every check already reads ledger-replayable
-truth.
+22/22 APM + 51/51 invariant tests.
+
+**S2.1 progress** (2026-09-19, ST-3/ST-2 trusted-state base): the shape
+guidance above is now the shape shipped. `src/intent.js` was refactored,
+`runtime.js` untouched (no new DEP this slice). ST-3: the eight
+determinable fields (state, stateVersion, contract, contractRevision,
+ownerEpoch, envelope, evidence, spent) live in ONE module-private record
+(a WeakMap) behind a setter-less `Intent` token view; `contract`/
+`envelope`/`evidence` are handed out as deep-frozen clones (capability
+tokens keep reference identity through the snapshot — they are opaque,
+not data), so `intent.contract.pop()` and `intent.state = "completed"`
+are TypeErrors that reach nothing. ST-2: exactly one lifecycle writer,
+`transition(intent, toState, cause)`, which reads the current state,
+validates the edge against the §2 table, bumps `stateVersion`, applies,
+and journals `{intent, fromState, toState, stateVersion, cause}` —
+illegal edges journal `intent_transition_denied` and move nothing.
+Every former setter (suspend/resume/fail/revoke/complete/handoff/
+requireLive) now routes through it; OPEN is genesis (version 0,
+`fromState: null`) and the first structural act is an explicit
+open→ACTIVE edge with a named cause, not a silent field write. A test
+scans the implementation source to prove no assignment to
+state/stateVersion exists outside that primitive — the single-writer
+claim is checkable, not asserted. Ledger replay reconstructs each
+intent's path and agrees with the read-only view; terminal states are
+terminal (revoking a completed intent is refused, not a history
+rewrite). The oracle was honest-tested: the six new ST-3/ST-2 tests all
+fail against the immediately-pre-fix `1fd6fa9`. This upgrades CO-1 from
+[partial] to **[pinned]** — "frozen/append-only" is now a property, not
+a convention. 28/28 APM + 51/51 invariant tests. **What this slice
+deliberately does NOT claim:** ST-4 total-order-over-dispatch (still
+spec §8 item 6); the COMPLETING check machinery (item 2 — the frozen
+contract holds, but completion is still the S1 gate plus SELECT-only
+claims, not a §3/§4 verification pass). Next, in spec order: the
+COMPLETING skeleton (ST-1 + four kinds + matcher) → DC-5.
 
 # Track E — enforcement
 

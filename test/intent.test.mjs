@@ -9,7 +9,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Runtime } from "../src/runtime.js";
-import { AgentSystem } from "../src/intent.js";
+import { AgentSystem, Intent } from "../src/intent.js";
 
 const asyncCode = async (p) => {
   try {
@@ -374,4 +374,109 @@ test("fork inherits approval; delegated child can be approved independently", as
   sys.approve(d, { once: true });
   await sys.call(d, slot, {}); // approved windows permit effect
   assert.equal(evs(rt, "intent_approve").at(-1).intent, d.id);
+});
+
+/* ---------- ST-3: the token is a view, the record is private ---------- */
+
+test("ST-3: every determinable field is read-only from the token — tampering is a TypeError, not a quiet mutation", () => {
+  const { sys, intent } = harness(); // grant already activated it
+  assert.equal(intent.state, "active");
+  assert.throws(() => { intent.state = "completed"; }, TypeError);
+  assert.throws(() => { intent.stateVersion = 99; }, TypeError);
+  assert.throws(() => { intent.contractRevision = 99; }, TypeError);
+  assert.throws(() => { intent.ownerEpoch = 99; }, TypeError);
+  assert.throws(() => { intent.spent = 99; }, TypeError);
+  assert.throws(() => { intent.envelope = []; }, TypeError);
+  assert.throws(() => { intent.contract = []; }, TypeError);
+  assert.throws(() => { intent.evidence = []; }, TypeError);
+  assert.equal(intent.state, "active"); // nothing moved
+  assert.equal(intent.spent, 0);
+});
+
+test("ST-3: snapshots out are frozen — pop/push/field-writes cannot reach the private record", async () => {
+  const { rt, sys, intent, slot } = contractHarness(["flight"]);
+  assert.throws(() => intent.contract.pop(), TypeError); // the old CO-1 bypass, dead
+  assert.throws(() => { intent.contract[0].id = "hijacked"; }, TypeError);
+  const { xact } = await sys.call(intent, slot, { job: 1 }, { for: ["flight"] });
+  await sys.complete(intent, [{ xact, obligation: "flight" }]);
+  assert.throws(() => intent.evidence.push({ xact: "forged", backed: true }), TypeError);
+  assert.throws(() => { intent.evidence[0].backed = false; }, TypeError);
+  assert.throws(() => { intent.envelope[0].slot = "attacker-slot"; }, TypeError);
+  // the record behind the snapshots never moved:
+  assert.deepEqual(intent.contract.map((o) => o.id), ["flight"]);
+  assert.equal(intent.evidence[0].backed, true);
+  assert.deepEqual(evs(rt, "intent_complete").at(-1).contract, ["flight"]);
+});
+
+/* ---------- ST-2: one lifecycle writer, replay-unique events ---------- */
+
+test("ST-2: OPEN is genesis, not a side effect — birth lands in the normalized shape", () => {
+  const rt = new Runtime();
+  const sys = new AgentSystem(rt);
+  const { server } = rt.serve("svc", "t", async () => 1);
+  const a = sys.register("g");
+  const intent = sys.open(a, { goal: { outcome: "x" } });
+  assert.equal(intent.state, "open");
+  assert.equal(intent.stateVersion, 0);
+  const g = evs(rt, "intent_state").at(-1);
+  assert.deepEqual(
+    { from: g.fromState, to: g.toState, v: g.stateVersion, cause: g.cause, intent: g.intent },
+    { from: null, to: "open", v: 0, cause: "open", intent: intent.id }
+  );
+  sys.grantFor(intent, server, "t"); // activation is an EDGE with a named cause, not a sneaky set
+  const e = evs(rt, "intent_state").at(-1);
+  assert.deepEqual({ from: e.fromState, to: e.toState, v: e.stateVersion, cause: e.cause }, { from: "open", to: "active", v: 1, cause: "grant" });
+});
+
+test("ST-2: illegal edges move nothing and are refusable facts; terminal is terminal", async () => {
+  const { rt, sys, intent, slot } = harness();
+  const { xact } = await sys.call(intent, slot, { job: 1 });
+  sys.suspend(intent);
+  const v = intent.stateVersion;
+  assert.throws(() => sys.suspend(intent), (e) => e.code === "E_STATE"); // suspended → suspended
+  assert.equal(intent.state, "suspended");
+  assert.equal(intent.stateVersion, v); // the denial changed no truth
+  const d = evs(rt, "intent_transition_denied").at(-1);
+  assert.deepEqual({ from: d.fromState, to: d.toState, v: d.stateVersion }, { from: "suspended", to: "suspended", v });
+  sys.resume(intent);
+  await sys.complete(intent, [{ xact }]);
+  const v2 = intent.stateVersion;
+  sys.revoke(intent); // revoking a fact would be editing history — refused silently by design
+  assert.equal(intent.state, "completed");
+  assert.equal(intent.stateVersion, v2);
+});
+
+test("ST-2: ledger replay reconstructs each intent's path — state is derived from facts, not mutable truth", async () => {
+  const { rt, sys, intent, slot } = harness();
+  const { xact } = await sys.call(intent, slot, { job: 1 });
+  sys.suspend(intent);
+  sys.resume(intent);
+  await sys.complete(intent, [{ xact }]);
+  let st = null, ver = -1, edges = 0;
+  for (const e of evs(rt, "intent_state")) {
+    if (e.intent !== intent.id) continue;
+    assert.equal(e.fromState, st, "replay must find the previous toState — no ambiguity");
+    assert.equal(e.stateVersion, ver + 1, "versions are strictly +1");
+    st = e.toState; ver = e.stateVersion; edges += 1;
+  }
+  assert.equal(st, intent.state); // replay agrees with the read-only view…
+  assert.equal(ver, intent.stateVersion); // …exactly
+  assert.equal(edges, 5); // genesis, grant, suspend, resume, complete
+});
+
+test("ST-2: the source itself proves a single lifecycle writer", () => {
+  const src = AgentSystem.toString() + "\n" + Intent.toString();
+  const tStart = src.indexOf("#transition(intent, toState, cause) {");
+  assert.ok(tStart >= 0, "#transition exists as the primitive");
+  const tEnd = src.indexOf("\n  }", tStart);
+  assert.ok(tEnd > tStart);
+  const writes = [
+    ...src.matchAll(/\.state\s*=[^=]/g),
+    ...src.matchAll(/\.stateVersion\s*(?:\+=|=[^=])/g),
+  ];
+  assert.ok(writes.length >= 2, "the primitive does write state and version");
+  for (const m of writes) {
+    assert.ok(m.index > tStart && m.index < tEnd,
+      "an assignment to state/stateVersion escaped #transition — there would be a second lifecycle writer");
+  }
 });

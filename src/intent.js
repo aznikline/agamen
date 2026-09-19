@@ -2,9 +2,16 @@
  * Agamen APM — the Agent Process Model (semantic track S).
  *
  * Conformance target: spec/apm.md. Landed so far: S1's lifecycle +
- * evidence gate, and S2.1's CO-5 dispatch-time obligation binding
+ * evidence gate; S2.1's CO-5 dispatch-time obligation binding
  * (receipt-kind CompletionContracts, append-only amend, ownerEpoch /
- * contractRevision stamps on every dispatch).
+ * contractRevision stamps on every dispatch); and the ST-3/ST-2 trusted
+ * state base — an Intent is a read-only token whose determinable truth
+ * lives in ONE private record (spec ST-3), written by exactly one
+ * lifecycle primitive (spec ST-2) that journals every edge as
+ * {intent, fromState, toState, stateVersion, cause}. State is derived
+ * from facts, not mutable truth: ledger replay reconstructs each
+ * intent's path, and no holder-side act can edit an intermediate state
+ * into existence.
  *
  * The question this layer answers: *which existing OS abstraction fails
  * first under agent workloads?* The process. A long-running, delegable,
@@ -22,7 +29,8 @@
  *     intents, and completion evidence. Like a process it has a lifecycle
  *     (open/fork/delegate/handoff/suspend/resume/revoke/complete); unlike
  *     a process it can be resumed on a different model and it cannot
- *     complete without journal-backed evidence.
+ *     complete without journal-backed evidence. To its holder it is a
+ *     VIEW: readable, never writable.
  *
  * Enforcement stays in the v1.6 substrate: agents are Runtime actors,
  * envelopes are capability grants with membranes, deadlines and outcomes
@@ -147,7 +155,35 @@ export class AgentExecution {
   }
 }
 
-/* ---------- Intent ---------- */
+/* ---------- Intent: token + one private state record (ST-3) ----------
+ * What a holder carries is a VIEW: identity and relations are readable
+ * plain fields; the DETERMINABLE truth — the eight fields spec ST-3
+ * names — lives in a single record reachable only from this module via
+ * PRIV, written only by AgentSystem. Views out (contract/envelope/
+ * evidence) are freshly frozen snapshots, so `intent.contract.pop()`
+ * or `intent.state = "completed"` edits nothing that will ever be
+ * checked. Capability tokens keep reference identity across the
+ * snapshot — they are opaque handles, not data to copy. */
+
+const PRIV = new WeakMap(); // Intent -> {state, stateVersion, contract, contractRevision, ownerEpoch, envelope, evidence, spent}
+
+function freezeDeep(v) {
+  if (v && typeof v === "object") {
+    for (const k of Object.keys(v)) freezeDeep(v[k]);
+    Object.freeze(v);
+  }
+  return v;
+}
+
+/* Lifecycle edges legal in this slice (spec §2 rows that S2.1 item 1
+ * covers). COMPLETING, WAITING_* and CANCELLED edges arrive with their
+ * own slices; terminal states have no outgoing edges, ever. Genesis is
+ * not in the table — the primitive admits exactly one null → open. */
+const LEGAL_EDGES = {
+  open: new Set(["active", "failed", "revoked"]),
+  active: new Set(["suspended", "completed", "failed", "revoked"]),
+  suspended: new Set(["active", "failed", "revoked"]),
+};
 
 export class Intent {
   id;
@@ -155,19 +191,10 @@ export class Intent {
   parent = null;
   children = new Set(); // child Intent ids
   goal; // the requested outcome, plain data
-  envelope = []; // {slot, cap} installed for this intent (attenuated grants)
   budget; // {calls} charged per mediated attempt through call()
-  spent = 0;
   deadline; // absolute ms, enforced by the substrate at request time
   approval; // "not_required" | "required" | { approved, at }
   context; // own Context (forked from the parent's snapshot when created)
-  state = "open"; // open | active | suspended | revoked | completed | failed
-  evidence = [];
-  // spec §5: two independent monotonic counters — a handoff must not be
-  // confused with a contract change, and neither with the passage of time
-  ownerEpoch = 1; // +1 per handoff (HO-1)
-  contractRevision = 0; // +1 per append-only amend (CO-1)
-  contract = []; // {id, kind, matcher, minOccurrences, bornRevision, bornEpoch}
   openedAt = nowIso();
 
   constructor({ agent, goal, budget = null, deadline = null, approval = "not_required", contextSeed = {}, contract = [] }) {
@@ -178,8 +205,30 @@ export class Intent {
     this.deadline = deadline;
     this.approval = approval;
     this.context = new Context(contextSeed, this.id);
-    this.contract = normalizeContract(contract).map((o) => ({ ...o, bornRevision: 0, bornEpoch: 1 }));
+    // state null / version -1 until the OPEN genesis edge lands them at
+    // open / 0 through the same primitive as every other edge (ST-2)
+    PRIV.set(this, {
+      state: null,
+      stateVersion: -1,
+      contract: normalizeContract(contract).map((o) => ({ ...o, bornRevision: 0, bornEpoch: 1 })),
+      contractRevision: 0,
+      ownerEpoch: 1, // HO-1: +1 per handoff
+      envelope: [], // {slot, cap} earned at the CURRENT holder's slot table
+      evidence: [],
+      spent: 0, // charged-attempt accounting through call()
+    });
   }
+
+  get state() { return PRIV.get(this).state; }
+  get stateVersion() { return PRIV.get(this).stateVersion; }
+  get contractRevision() { return PRIV.get(this).contractRevision; }
+  get ownerEpoch() { return PRIV.get(this).ownerEpoch; }
+  get spent() { return PRIV.get(this).spent; }
+  get contract() { return Object.freeze(PRIV.get(this).contract.map((o) => freezeDeep({ ...o }))); }
+  get envelope() {
+    return Object.freeze(PRIV.get(this).envelope.map((e) => Object.freeze({ slot: e.slot, cap: e.cap })));
+  }
+  get evidence() { return Object.freeze(PRIV.get(this).evidence.map((ev) => freezeDeep({ ...ev }))); }
 }
 
 /* ---------- the system: host-plane glue ---------- */
@@ -205,13 +254,14 @@ export class AgentSystem {
       t: "intent_open", intent: intent.id, agent: agent.id, goal, budget, deadline, approval,
       contract: intent.contract.map((o) => o.id),
     });
+    this.#transition(intent, "open", "open"); // genesis rides the same primitive — no special case
     return intent;
   }
 
   /** Fork: a child intent on the SAME agent; its context branches from a
    *  copy of the parent's snapshot. */
   fork(parentIntent, { goal, budget = null, deadline = null, approval, contract = [] } = {}) {
-    this.#requireLive(parentIntent);
+    this.#live(parentIntent, "fork");
     const child = new Intent({
       agent: parentIntent.agent,
       goal: goal ?? parentIntent.goal,
@@ -225,13 +275,14 @@ export class AgentSystem {
     parentIntent.children.add(child.id);
     this.#track(parentIntent.agent, child);
     this.#fact({ t: "intent_fork", intent: child.id, parent: parentIntent.id, agent: child.agent.id });
+    this.#transition(child, "open", "fork"); // genesis rides the same primitive
     return child;
   }
 
   /** Delegate: a NEW child intent executed by another agent; the parent
    *  keeps ownership and receives the merged result. */
   delegate(parentIntent, targetAgent, { goal, budget = null, deadline = null, approval, contract = [] } = {}) {
-    this.#requireLive(parentIntent);
+    this.#live(parentIntent, "delegate");
     const child = new Intent({
       agent: targetAgent,
       goal: goal ?? parentIntent.goal,
@@ -248,6 +299,7 @@ export class AgentSystem {
       t: "intent_delegate", intent: child.id, parent: parentIntent.id,
       from: parentIntent.agent.id, to: targetAgent.id,
     });
+    this.#transition(child, "open", "delegate"); // genesis rides the same primitive
     return child;
   }
 
@@ -256,21 +308,22 @@ export class AgentSystem {
    *  removal path here on purpose — retiring a requirement is
    *  supersede/waiver (§8 item 5), a separate owned act. */
   amend(intent, obligations) {
-    this.#requireLive(intent);
+    this.#live(intent, "amend");
     const added = normalizeContract(obligations);
-    const have = new Set(intent.contract.map((o) => o.id));
+    const rec = PRIV.get(intent);
+    const have = new Set(rec.contract.map((o) => o.id));
     for (const ob of added) {
       if (have.has(ob.id)) throw new SubstrateError("E_INVAL", `obligation '${ob.id}' is already in the contract`);
     }
-    intent.contractRevision += 1;
+    rec.contractRevision += 1;
     for (const ob of added) {
-      intent.contract.push({ ...ob, bornRevision: intent.contractRevision, bornEpoch: intent.ownerEpoch });
+      rec.contract.push({ ...ob, bornRevision: rec.contractRevision, bornEpoch: rec.ownerEpoch });
     }
     this.#fact({
-      t: "contract_amend", intent: intent.id, revision: intent.contractRevision,
-      epoch: intent.ownerEpoch, added: added.map((o) => o.id),
+      t: "contract_amend", intent: intent.id, revision: rec.contractRevision,
+      epoch: rec.ownerEpoch, added: added.map((o) => o.id),
     });
-    return intent.contract.map((o) => o.id);
+    return intent.contract.map((o) => o.id); // frozen snapshot of ids
   }
 
   /** Handoff: the INTENT moves, its AUTHORITY does not. Goal, context
@@ -285,27 +338,27 @@ export class AgentSystem {
    *  (grantFor), and only what it re-earns it may spend. Contrast
    *  delegate, which spawns a child elsewhere and keeps ownership. */
   handoff(intent, targetAgent) {
-    this.#requireLive(intent);
+    this.#live(intent, "handoff");
+    const rec = PRIV.get(intent);
     const from = intent.agent;
     from.intents.delete(intent.id);
     targetAgent.intents.set(intent.id, intent);
     intent.agent = targetAgent;
-    for (const { cap } of intent.envelope) {
+    for (const { cap } of rec.envelope) {
       try { this.rt.revoke(cap); } catch { /* already dead — foreign/revoked */ }
     }
-    const slots = intent.envelope.map((e) => e.slot);
-    intent.envelope = []; // new holder must re-grant before it can call
-    intent.ownerEpoch += 1; // HO-1: work and promises order against the epoch they were made under
+    const slots = rec.envelope.map((e) => e.slot);
+    rec.envelope = []; // new holder must re-grant before it can call
+    rec.ownerEpoch += 1; // HO-1: work and promises order against the epoch they were made under
     this.#fact({
       t: "intent_handoff", intent: intent.id, from: from.id, to: targetAgent.id,
-      envelope: "revoked", slots, ownerEpoch: intent.ownerEpoch,
+      envelope: "revoked", slots, ownerEpoch: rec.ownerEpoch,
     });
     return intent;
   }
 
   suspend(intent) {
-    this.#require(intent, "active");
-    intent.state = "suspended";
+    this.#transition(intent, "suspended", "suspend");
     this.#fact({ t: "intent_suspend", intent: intent.id, agent: intent.agent.id });
   }
 
@@ -313,13 +366,13 @@ export class AgentSystem {
    *  authority, context and budget survive; the "CPU" does not. A process
    *  API cannot express this transition. */
   resume(intent, { model = null } = {}) {
-    this.#require(intent, "suspended");
+    this.#require(intent, "suspended"); // trigger guard: only a park may resume
     if (model !== null && model !== intent.agent.model) {
       const prev = intent.agent.model;
       intent.agent.model = model;
       this.#fact({ t: "agent_rebind", agent: intent.agent.id, from: prev, to: model });
     }
-    intent.state = "active";
+    this.#transition(intent, "active", "resume");
     this.#fact({ t: "intent_resume", intent: intent.id, agent: intent.agent.id });
   }
 
@@ -339,7 +392,8 @@ export class AgentSystem {
    *  A budget membrane is attached at grant time, so the substrate — not
    *  this layer — ultimately charges the attempts. */
   grantFor(intent, fromControl, fromSlot, opts = {}) {
-    this.#requireLive(intent);
+    this.#live(intent, "grant");
+    const rec = PRIV.get(intent);
     const slot = `intent:${intent.id}:${fromSlot}`;
     const membranes = intent.budget ? [rateLimit(intent.budget.calls)] : [];
     const cap = this.rt.grantCap(
@@ -348,7 +402,7 @@ export class AgentSystem {
       slot,
       { rights: opts.rights ?? ["send"], membranes }
     );
-    intent.envelope.push({ slot, cap });
+    rec.envelope.push({ slot, cap });
     this.#fact({ t: "intent_grant", intent: intent.id, agent: intent.agent.id, slot, tool: fromSlot });
     return slot;
   }
@@ -361,38 +415,37 @@ export class AgentSystem {
    *  (CO-5); an anonymous call is legal but can never be re-labelled
    *  into a receipt at completion time. */
   async call(intent, slot, args, { for: obligationIds = [] } = {}) {
-    this.#requireLive(intent);
+    this.#live(intent, "call");
+    const rec = PRIV.get(intent);
     const denied = (code, msg) => {
       this.#fact({ t: "intent_call", intent: intent.id, slot, outcome: "denied", code });
       throw new SubstrateError(code, msg);
     };
     if (intent.state === "suspended") denied("E_STATE", "suspended intents make no calls; resume first");
-    if (!intent.envelope.some((e) => e.slot === slot)) {
+    if (!rec.envelope.some((e) => e.slot === slot)) {
       denied("E_NO_CAP", `slot '${slot}' is not part of this intent's envelope`);
     }
     if (intent.approval === "required") {
       denied("E_APPROVAL", "intent requires approval before effecting calls");
     }
-    if (intent.budget && intent.spent >= intent.budget.calls) {
+    if (intent.budget && rec.spent >= intent.budget.calls) {
       denied("E_BUDGET", `intent budget exhausted (${intent.budget.calls} calls)`);
     }
     if (!Array.isArray(obligationIds)) denied("E_INVAL", "obligation bindings must be a list of ids");
-    const byId = new Map(intent.contract.map((o) => [o.id, o]));
+    const byId = new Map(rec.contract.map((o) => [o.id, o]));
     for (const oid of obligationIds) {
       if (!byId.has(oid)) {
-        denied("E_INVAL", `dispatch binds no obligation: '${oid}' is not in ${intent.id}'s contract at revision ${intent.contractRevision}`);
+        denied("E_INVAL", `dispatch binds no obligation: '${oid}' is not in ${intent.id}'s contract at revision ${rec.contractRevision}`);
       }
     }
-    intent.spent += 1; // charged-attempt, mirroring membrane semantics
+    rec.spent += 1; // charged-attempt, mirroring membrane semantics
     let xact = null;
     try {
       // request() denies synchronously (deadline/cap/clone); it must still
       // land inside the try or the refusal would leave no intent-level fact.
       // The binding fact is written in the substrate's ADMIT HOOK — after
-      // the xact exists, before the handler runs. The effect therefore
-      // cannot begin, let alone be observed, until the ledger already
-      // names the obligations it was dispatched for (CO-5, binding
-      // precedes effect literally, not just "precedes the await").
+      // the xact exists, before the handler runs, reading the private
+      // record's (epoch, revision) as they stand at dispatch (CO-5).
       const req = this.rt.request(intent.agent.control, slot, args, {
         correlationId: intent.id,
         deadline: intent.deadline,
@@ -400,7 +453,7 @@ export class AgentSystem {
           xact = x;
           this.#fact({
             t: "intent_dispatch", intent: intent.id, slot, xact: x,
-            ownerEpoch: intent.ownerEpoch, contractRevision: intent.contractRevision,
+            ownerEpoch: rec.ownerEpoch, contractRevision: rec.contractRevision,
             obligationIds: [...new Set(obligationIds)],
           });
         },
@@ -435,24 +488,25 @@ export class AgentSystem {
    *  With an empty contract the S1 gate remains: at least one ledger-
    *  backed ok effect — the degenerate one-obligation case. */
   async complete(intent, claims = []) {
-    this.#requireLive(intent);
-    if (intent.contract.length > 0) return this.#completeAgainstContract(intent, claims);
+    this.#live(intent, "complete");
+    if (PRIV.get(intent).contract.length > 0) return this.#completeAgainstContract(intent, claims);
     if (!Array.isArray(claims) || claims.length === 0) {
       throw new SubstrateError("E_NO_EVIDENCE", "completion requires at least one evidence item");
     }
+    const rec = PRIV.get(intent);
     const backed = this.#journalBackedXacts(intent);
     for (const item of claims) {
       const isBacked = !!(item && item.xact && backed.has(item.xact));
       if (item && item.xact && !isBacked) {
         throw new SubstrateError("E_NO_EVIDENCE", `evidence xact '${item.xact}' is not a journaled ok call on this intent`);
       }
-      intent.evidence.push({ ...cloneOrWrap(item), backed: isBacked });
+      rec.evidence.push({ ...cloneOrWrap(item), backed: isBacked });
     }
-    if (!intent.evidence.some((e) => e.backed)) {
+    if (!rec.evidence.some((e) => e.backed)) {
       throw new SubstrateError("E_NO_EVIDENCE", "no evidence item is backed by the ledger");
     }
-    intent.state = "completed";
-    this.#fact({ t: "intent_complete", intent: intent.id, agent: intent.agent.id, evidence: intent.evidence.length });
+    this.#transition(intent, "completed", "complete");
+    this.#fact({ t: "intent_complete", intent: intent.id, agent: intent.agent.id, evidence: rec.evidence.length });
     return intent;
   }
 
@@ -460,9 +514,10 @@ export class AgentSystem {
     if (!Array.isArray(claims)) {
       throw new SubstrateError("E_INVAL", "completion takes a list of {xact, obligation} claims");
     }
+    const rec = PRIV.get(intent);
     const backed = this.#journalBackedXacts(intent);
     const bindings = this.#dispatchBindings(intent);
-    const discharged = new Map(intent.contract.map((o) => [o.id, new Set()]));
+    const discharged = new Map(rec.contract.map((o) => [o.id, new Set()]));
     const refuse = (claim, why) => {
       this.#fact({ t: "completion_denied", intent: intent.id, claim: claim ?? null, why });
       throw new SubstrateError("E_NO_EVIDENCE", why);
@@ -475,45 +530,50 @@ export class AgentSystem {
       if (!bind.obligationIds.includes(obligation)) {
         refuse(claim, `CO-5: '${xact}' was bound at dispatch to [${bind.obligationIds.join(", ") || "anonymous"}], not '${obligation}' — bindings precede effects`);
       }
-      const ob = intent.contract.find((o) => o.id === obligation);
+      const ob = rec.contract.find((o) => o.id === obligation);
       if (ob.bornEpoch > bind.ownerEpoch || ob.bornRevision > bind.contractRevision) {
         refuse(claim, `HO-4: obligation '${obligation}' was born at (epoch ${ob.bornEpoch}, rev ${ob.bornRevision}) — after the dispatch's (epoch ${bind.ownerEpoch}, rev ${bind.contractRevision}); past work cannot pay for future promises`);
       }
       discharged.get(obligation).add(xact);
     }
-    const unmet = intent.contract
+    const unmet = rec.contract
       .filter((o) => discharged.get(o.id).size < o.minOccurrences)
       .map((o) => o.id);
     if (unmet.length) {
       this.#fact({ t: "completion_denied", intent: intent.id, unmet });
       throw new SubstrateError("E_NO_EVIDENCE", `unmet obligations: ${unmet.join(", ")}`);
     }
-    intent.evidence.push(...claims.map((c) => ({ ...cloneOrWrap(c), backed: true })));
-    intent.state = "completed";
+    rec.evidence.push(...claims.map((c) => ({ ...cloneOrWrap(c), backed: true })));
+    this.#transition(intent, "completed", "complete");
     this.#fact({
       t: "intent_complete", intent: intent.id, agent: intent.agent.id,
-      contract: intent.contract.map((o) => o.id), evidence: intent.evidence.length,
+      contract: rec.contract.map((o) => o.id), evidence: rec.evidence.length,
     });
     return intent;
   }
 
   fail(intent, reason) {
-    this.#requireLive(intent);
-    intent.state = "failed";
+    this.#live(intent, "fail");
+    this.#transition(intent, "failed", "fail");
     this.#fact({ t: "intent_fail", intent: intent.id, agent: intent.agent.id, reason: String(reason ?? "") });
   }
 
   /** Revoke: the whole subtree dies; every envelope capability is revoked
-   *  in the substrate, so in-flight authority disappears with it (#6). */
+   *  in the substrate, so in-flight authority disappears with it (#6).
+   *  Terminal is terminal: a completed or failed intent keeps its state
+   *  (revoking a fact would be editing history) — but the cascade still
+   *  runs down, because the children may not be terminal. */
   revoke(intent) {
-    if (intent.state === "revoked") return;
-    intent.state = "revoked";
-    for (const { cap } of intent.envelope) {
-      try {
-        this.rt.revoke(cap);
-      } catch { /* dead or foreign caps cannot block the fact of revocation */ }
+    const s = intent.state;
+    if (s !== "revoked" && s !== "completed" && s !== "failed") {
+      for (const { cap } of PRIV.get(intent).envelope) {
+        try {
+          this.rt.revoke(cap);
+        } catch { /* dead or foreign caps cannot block the fact of revocation */ }
+      }
+      this.#transition(intent, "revoked", "revoke");
+      this.#fact({ t: "intent_revoke", intent: intent.id, agent: intent.agent.id });
     }
-    this.#fact({ t: "intent_revoke", intent: intent.id, agent: intent.agent.id });
     for (const childId of intent.children) {
       const child = this.intents.get(childId);
       if (child) this.revoke(child);
@@ -553,12 +613,44 @@ export class AgentSystem {
     this.rt.record({ ...ev, at: nowIso() });
   }
 
-  #requireLive(intent) {
-    if (intent.state === "suspended" || intent.state === "open" || intent.state === "active") {
-      if (intent.state === "open") intent.state = "active"; // first structural act activates
-      return;
+  /* The one lifecycle writer (ST-2). An edge is read, validated,
+   * versioned, applied and journalled here or nowhere: no method of
+   * this class assigns state or stateVersion itself, so the journal of
+   * `intent_state` facts is by construction replay-unique —
+   * {intent, fromState, toState, stateVersion, cause} with
+   * fromState == the previous event's toState and stateVersion exactly
+   * +1. Illegal edges move nothing and are refusable facts, not
+   * silence. Genesis (null → open, version 0) rides the same
+   * primitive. */
+  #transition(intent, toState, cause) {
+    const rec = PRIV.get(intent);
+    const fromState = rec.state;
+    const legal = fromState === null ? toState === "open" : (LEGAL_EDGES[fromState]?.has(toState) ?? false);
+    if (!legal) {
+      this.#fact({
+        t: "intent_transition_denied", intent: intent.id,
+        fromState, toState, stateVersion: rec.stateVersion, cause,
+      });
+      throw new SubstrateError("E_STATE", `intent ${intent.id}: ${fromState} → ${toState} is not a legal edge (state and version unchanged)`);
     }
-    throw new SubstrateError("E_STATE", `intent ${intent.id} is ${intent.state}`);
+    rec.state = toState;
+    rec.stateVersion += 1;
+    this.#fact({
+      t: "intent_state", intent: intent.id, fromState, toState,
+      stateVersion: rec.stateVersion, cause, agent: intent.agent.id,
+    });
+    return intent;
+  }
+
+  /* Live-for-an-operation, activated EXPLICITLY: OPEN is genesis, and
+   * the first structural act moves the intent to ACTIVE through the
+   * transition primitive with that act as the journaled cause — never
+   * by a side door mutating state. */
+  #live(intent, cause) {
+    const s = intent.state;
+    if (s === "open") { this.#transition(intent, "active", cause); return; }
+    if (s === "active" || s === "suspended") return;
+    throw new SubstrateError("E_STATE", `intent ${intent.id} is ${s}`);
   }
 
   #require(intent, ...states) {

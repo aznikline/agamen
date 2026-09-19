@@ -1,11 +1,13 @@
 # APM — the Agamen Agent Process Model (normative, S2)
 
-> Status: **normative spec, rev. S2.0.2** — it stands on its own;
+> Status: **normative spec, rev. S2.0.3** — it stands on its own;
 > `src/intent.js` (S1) is its first, partial implementation. S2.0.1 closed
 > the spec-review gaps (§8 lists the six pins); S2.0.2 is the round-6
 > honesty patch: CO-5 is defined as a three-phase order (binding
 > precedes HANDLER execution, not every admission/policy side effect),
-> and §7 records DEP-1, the first true S→E cross-track dependency.
+> and §7 records DEP-1, the first true S→E cross-track dependency;
+> S2.0.3 syncs labels to the landed ST-3/ST-2 state base (ST-2, ST-3,
+> CO-1 now [pinned]; ST-4 explicitly NOT claimed by it).
 > This file inherits the
 > vocabulary of `spec/invariants.md` and the track definitions of
 > `ROADMAP.md`.
@@ -136,8 +138,14 @@ ST-2  Every state edge is a journaled fact in one normalized shape:
       replay therefore yields exactly one legal path per intent —
       duplicate or out-of-order events are refusable facts, not
       ambiguity. This is the primitive in the purest sense: *state is
-      derived from facts, not mutable truth*. [planned: S1 events carry
-      no from/to/version yet]
+      derived from facts, not mutable truth*. [pinned in S2.1: `ledger
+      replay reconstructs each intent's path` (the journal alone
+      reproduces every intent's final state and version), `OPEN is
+      genesis, not a side effect` (genesis is version 0, fromState null,
+      and activation is an EDGE with a named cause — no silent
+      open→active), `illegal edges move nothing and are refusable facts`
+      (a rejected transition journals intent_transition_denied and leaves
+      state/version untouched)]
 ST-3  Lifecycle state is private to the model layer; principals get
       read-only views. The private set is at minimum:
         state, contract, contractRevision, ownerEpoch, envelope,
@@ -145,9 +153,17 @@ ST-3  Lifecycle state is private to the model layer; principals get
       — anything less lets a caller mutate the very things the checks
       read (a `contract.pop()` erases an obligation with no fact), and
       "frozen/append-only" remains an API convention, not a property.
-      (S1 debt: fields are public — the strong reading of OT's second
-      line requires this before it may be claimed. [planned, widened
-      in round-5 review; gates CO-1's [pinned]])
+      The write path is singular: exactly one lifecycle writer exists,
+      and the source is checkable for that. [pinned in S2.1: `every
+      determinable field is read-only from the token` (a setter-less view
+      — assignment is a TypeError, and the eight fields live in one
+      module-private record), `snapshots out are frozen` (the arrays a
+      view hands back are frozen deep clones; mutating them cannot reach
+      the record — this is what finally makes "contract.pop() is futile"
+      a property, and it is what gates CO-1's [pinned]), `the source
+      itself proves a single lifecycle writer` (a test scans the
+      implementation for state/version assignments outside the one
+      transition primitive)]
 ST-4  Intent transition serial order: effect dispatch, handoff, revoke
       (including each cascade leg), approval consumption,
       amend/supersede, and every lifecycle edge on one intent are
@@ -182,13 +198,15 @@ CO-1  Every intent carries a CompletionContract, frozen at creation
       the contract names (default: an approval obligation — erasing a
       requirement is a decision someone must own). Amend/supersede
       bumps `contractRevision` and reopens COMPLETING checks for
-      previously satisfied obligations. [partial: the append-only amend
-      act and revision bump are pinned in S2.1 (`append-only amend —
-      work done before an obligation is born can never pay for it`),
-      but the obligation ARRAY is still publicly mutable — pop/push/
-      field-writes can bypass amend and its fact. "Frozen" is a lie
-      until ST-3 privatizes these fields. supersede/waiver planned
-      (§8 item 5)]
+      previously satisfied obligations. [pinned in S2.1: `append-only
+      amend — work done before an obligation is born can never pay for
+      it` + `snapshots out are frozen` (the array is no longer publicly
+      reachable — pop/push/field-writes are TypeErrors against frozen
+      views, so bypassing amend is not futile-but-possible, it is
+      impossible; ST-3's privatization is what converted "frozen" from
+      convention to property). supersede/waiver themselves remain
+      planned (§8 item 5) — the freeze property holds with them absent,
+      because there is NO removal path at all]
 CO-2  The contract is a finite set of obligations, each:
         { id, kind, matcher, minOccurrences, bornRevision }
       where `bornRevision` is the contractRevision at which the
@@ -437,16 +455,24 @@ dispatch linearization point → effect-bearing handler), retiring the
 the first true S→E dependency (CO-5 required the substrate's admit
 hook), replacing the "adds zero substrate mechanisms" line.
 
+**S2.0.3 (label sync after the ST-3/ST-2 slice landed, 2026-09-19)** —
+no new rules: ST-2, ST-3 and (consequently) CO-1 move from
+planned/partial to [pinned] with their test names; §8 item 1 is struck.
+ST-4 gains nothing from this slice and says so.
+
 **S2.1 (next code, in this order — reordered after round-5 review so no
 check ever runs against mutable truth)**
 
-1. lifecycle privatization (ST-3, widened: state, contract,
-   contractRevision, ownerEpoch, envelope, evidence, spent) +
-   normalized, replay-unique events (ST-2);
+1. ~~lifecycle privatization + replay-unique events~~ LANDED (ST-3
+   pinned: one private state record behind a setter-less token view;
+   ST-2 pinned: genesis and every edge through one transition
+   primitive, replay reconstructs each path, illegal edges are refusable
+   facts; CO-1 upgraded to [pinned] on the strength of it — ST-4 is
+   NOT claimed by this, the total-order-over-dispatch proof is still
+   item 6's work);
 2. the COMPLETING skeleton complete: ST-1 entry-as-check, all four
-   obligation kinds, matcher semantics (CO-1…4) — CO-1 may only be
-   marked [pinned] when item 1 makes "frozen" a property, not a
-   convention;
+   obligation kinds, matcher semantics (CO-2…4) — what remains here is
+   the CHECK machinery, the frozen-contract property already holds;
 3. closure negative gate first, as a test before the feature (DC-5);
 4. ~~dispatch-time binding~~ LANDED (CO-5 pinned by the temporal test;
    written in the substrate's admit hook, refusing matcher included);
