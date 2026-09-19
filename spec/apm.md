@@ -1,8 +1,12 @@
 # APM — the Agamen Agent Process Model (normative, S2)
 
-> Status: **normative spec, rev. S2.0.1** — it stands on its own;
+> Status: **normative spec, rev. S2.0.2** — it stands on its own;
 > `src/intent.js` (S1) is its first, partial implementation. S2.0.1 closed
-> the spec-review gaps (§8 lists the six pins). This file inherits the
+> the spec-review gaps (§8 lists the six pins); S2.0.2 is the round-6
+> honesty patch: CO-5 is defined as a three-phase order (binding
+> precedes HANDLER execution, not every admission/policy side effect),
+> and §7 records DEP-1, the first true S→E cross-track dependency.
+> This file inherits the
 > vocabulary of `spec/invariants.md` and the track definitions of
 > `ROADMAP.md`.
 > Rule ids (`OT-*`, `ST-*`, `CO-*`, `DC-*`, `HO-*`, `AT-*`) are citable.
@@ -213,15 +217,29 @@ CO-4  The contract is the boundary of the promise: Agamen guarantees
       guarantees NOTHING about whether the discharge means the world
       is in the desired state. That is the exact content of
       *evidence is not correctness*.
-CO-5  Obligation binding precedes the effect — literally. The binding
-      is journalled AFTER the xact exists and BEFORE the handler
-      executes (the substrate's host-plane admit hook is the one sound
-      place; "written after request() returns" is NOT dispatch-time —
-      a synchronous effect would already have happened). The dispatch
-      fact of an effect-bearing call carries
+CO-5  Obligation binding precedes the effect. Dispatch is three
+      ordered phases:
+        admission/policy phase   (rights, deadline, clone, membranes —
+                                  a charged rate-limit attempt happens
+                                  HERE, before the dispatch is admitted)
+        ↓
+        CO-5 dispatch linearization point (xact exists and is final;
+                                  the binding fact is journalled)
+        ↓
+        effect-bearing handler   (nothing the ENDPOINT does can begin
+                                  until the ledger already carries the
+                                  binding)
+      The binding is journalled at the middle phase — the substrate's
+      host-plane admit hook is the one sound place; "written after
+      request() returns" is NOT dispatch-time — a synchronous effect
+      would already have happened. Precisely: the guarantee is that the
+      binding precedes HANDLER execution, not that it precedes every
+      admission/policy side effect; policy must finish admitting before
+      a dispatch can be honoured with a binding. The dispatch fact of
+      an effect-bearing call carries
         { intent, ownerEpoch, contractRevision, obligationIds, xact }
       — the obligations the call was made FOR, in the ledger before
-      anything it does can begin, let alone be observed. Completion may
+      the handler's work begins, let alone is observed. Completion may
       only consume bindings the ledger recorded at dispatch;
       re-labelling an anonymous past call at completion time is
       structurally impossible, because no completion-time act can write
@@ -358,12 +376,32 @@ kernel-visible grant — decided by the charter, not by taste.
 
 ## 7. Relation to the substrate and to agate
 
-APM is Track S: it adds zero substrate mechanisms. Every rule lands on
-existing primitives (WeakMap authority, consent grants, correlationIds,
-the journal) or on new *facts*, never on new authority. Invariant
-references: states ↔ #9; evidence/facts ↔ #10; envelope ⊥ ownership ↔
-#1, #2, #3, #6; contract immutability ↔ #11 in its "output may
-request, never widen" form.
+APM is Track S: it defines semantics, not enforcement, and until now it
+has landed every rule on existing primitives (WeakMap authority, consent
+grants, correlationIds, the journal) or on new *facts*, never on new
+authority. That streak ended, instructively, at CO-5: binding-before-
+effect demanded a linearization point between "dispatch admitted" and
+"handler executing" that the substrate did not have — a fact written
+after `request()` returns follows the synchronous effect it promised to
+precede. So Track E added one minimal mechanism, the host-plane admit
+hook (`request(…, { onAdmit })`), and this is recorded as the first true
+cross-track dependency:
+
+```
+DEP-1  S: CO-5 binding-before-effect
+         → requires →
+       E: a pre-handler admission linearization point (admit hook)
+```
+
+Two tracks not mixing does NOT mean the two never interact: the
+interaction law is directional — semantics state an obligation, and
+enforcement supplies the minimal mechanism that makes it keepable.
+DEP-1 is the template, not the exception to worry about; what would
+corrupt both tracks is S diluting an obligation to whatever is
+currently enforceable, or E growing a mechanism no S rule asked for.
+Invariant references: states ↔ #9; evidence/facts ↔ #10; envelope ⊥
+ownership ↔ #1, #2, #3, #6; contract immutability ↔ #11 in its "output
+may request, never widen" form.
 
 The Linux-library test (ROADMAP), stated honestly: ST-2 alone proves
 nothing — an ordinary async library can append events, hash-chain
@@ -391,6 +429,13 @@ per-intent serial order (ST-4); the D-graph relation split
 parentage/join-policy (DC-4) with race losers `CANCELLED(reason)`
 (DC-3); normalized replay events `from/to/stateVersion/cause` (ST-2);
 and the demoted, honest Linux-library test (§7).
+
+**S2.0.2 (round-6 honesty patch, landed 2026-09-19 — spec + docs only,
+no code)** — CO-5 restated as the three-phase order (admission/policy →
+dispatch linearization point → effect-bearing handler), retiring the
+"before anything it does" overclaim; §7 rewritten to record **DEP-1**,
+the first true S→E dependency (CO-5 required the substrate's admit
+hook), replacing the "adds zero substrate mechanisms" line.
 
 **S2.1 (next code, in this order — reordered after round-5 review so no
 check ever runs against mutable truth)**

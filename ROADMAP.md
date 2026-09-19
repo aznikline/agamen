@@ -32,7 +32,9 @@ acceptance table in `spec/invariants.md` and the charter in
 The tracks share invariant numbering and the same ledger vocabulary, but
 they gate each other only where stated: enforcement may lag semantics
 (label it simulated/normative, never silently); semantics must never be
-diluted to whatever is currently enforceable.
+diluted to whatever is currently enforceable. The stated gates are
+recorded as dependencies in spec §7 — the first is DEP-1: S's CO-5
+binding-before-effect required E's pre-handler admission hook.
 
 # Track S — the operating model
 
@@ -56,7 +58,7 @@ provable against each other. The negative gate is the milestone:
 `complete()` refuses without at least one evidence item backed by a
 journaled `ok` invocation. Acceptance: 13 lifecycle + negative tests.
 
-## S2 — APM as normative spec (rev. S2.0.1, `spec/apm.md`)
+## S2 — APM as normative spec (rev. S2.0.2, `spec/apm.md`)
 
 The spec stands on its own, independent of the JavaScript prototype. It
 is built on three separations — **Ownership is not authority. Evidence
@@ -85,30 +87,63 @@ race losers `CANCELLED(reason=race_lost)` ("cancellation revokes
 future authority, not past effects"), and the Linux-library argument
 demoted to an honest conjunction that Track E must still face.
 
+**S2.0.2** (2026-09-19, docs-only honesty patch after round-6 review):
+CO-5's "before the effect" is now defined as a three-phase order —
+admission/policy (where membranes charge attempts), the dispatch
+linearization point (where the binding is journalled), the
+effect-bearing handler — retiring any reading of "before every side
+effect"; and §7 records **DEP-1**, the first true S→E dependency:
+Track S's CO-5 demanded a pre-handler linearization point the substrate
+did not have, and Track E supplied one (`onAdmit`). The tracks staying
+separate was never the tracks never interacting — the interaction law
+is direction: semantics state obligations, enforcement answers with the
+minimal mechanism, and neither borrows the other's identity.
+
 **S2.1** (next code, order fixed by the spec §8): lifecycle
 privatization + replay-unique events; contract + COMPLETING; the
 closure negative gate first (no parent completion over live required
 children — S1 permits it today); dispatch-time binding stamps; join
 policies over split parentage + supersede/waiver; epoch/revision
-stamping; AttentionRequest. All inside `src/intent.js`. No runtime
-features ride along.
+stamping; AttentionRequest. Default rule: stay inside `src/intent.js` —
+but the rule now has a named exception channel: an S rule that needs a
+substrate guarantee gets one only as a recorded cross-track dependency
+(spec §7 DEP-1), with the mechanism kept minimal and host-plane-only.
 
-**S2.1 progress** (2026-09-19, round-5 hardened): dispatch-time
-obligation binding landed (spec §8 item 4, early by owner's request).
-The binding is journalled in the substrate's new host-plane **admit
-hook** (`request(…, { onAdmit })` — after the xact exists, before the
-handler runs; a throwing hook vetoes before any effect and settles as
-a fact), pinned by a temporal test in which the effect itself reads
-its binding out of the ledger. `receipt` obligations at
-open/fork/delegate, append-only `amend` (bumps `contractRevision`);
-non-null `matcher` REFUSED until matcher semantics land; `handoff`
-bumps `ownerEpoch`; `complete()` claims only SELECT. 22/22 APM +
-51/51 invariant tests. Honest labels: CO-1 is **[partial]** — the
-contract array is still publicly mutable; ST-3 (widened to
+**S2.1 progress** (2026-09-19, round-5/6 hardened): dispatch-time
+obligation binding landed (spec §8 item 4, early by owner's request)
+and CO-5 is **[pinned]**. The binding is journalled in the substrate's
+new host-plane **admit hook** (`request(…, { onAdmit })` — after the
+xact exists, before the handler runs; a throwing hook vetoes before any
+effect and settles as a fact), pinned by a temporal test in which the
+effect itself reads its binding out of the ledger (verified to fail
+against the pre-fix `e17465a`). This was the FIRST true S→E
+dependency: CO-5's binding-before-effect could not be honoured by the
+existing substrate, so Track E grew the admission linearization point —
+semantics stated the obligation, enforcement supplied the minimal
+mechanism (spec §7 DEP-1; the earlier "no runtime features ride along"
+phrasing was the overclaim it corrects). CO-5 wording precision
+(round 6): the guarantee is binding-precedes-HANDLER-execution;
+membranes/charged attempts belong to the admission/policy phase that
+precedes the linearization point. Landed alongside: `receipt`
+obligations at open/fork/delegate, append-only `amend` (bumps
+`contractRevision`); non-null `matcher` REFUSED until matcher semantics
+land; `handoff` bumps `ownerEpoch`; `complete()` claims only SELECT.
+22/22 APM + 51/51 invariant tests. Honest labels: CO-1 is **[partial]**
+— the contract array is still publicly mutable; ST-3 (widened to
 state/contract/revisions/epoch/envelope/evidence/spent) is what turns
 "append-only" from convention into property. Next, in spec order:
 ST-3 → ST-2 → the COMPLETING skeleton (ST-1 + four kinds + matcher) →
-DC-5 — no check runs against mutable truth, no fourth oracle.
+DC-5 — no check runs against mutable truth, no fourth oracle. Shape
+guidance for those two slices: ST-3 is ONE private state record behind
+a read-only intent view (state, stateVersion, contract,
+contractRevision, ownerEpoch, envelope, evidence, spent — all mutation
+only through `AgentSystem`), not a field-by-field `#private` sprinkle;
+ST-2 collapses every state change into ONE `transition(intent,
+toState, cause)` primitive that atomically journalls
+`{intent, fromState, toState, stateVersion, cause}` and checks
+`fromState == current` and `nextVersion == current + 1` — so by the
+time COMPLETING/DC-5 land, every check already reads ledger-replayable
+truth.
 
 # Track E — enforcement
 
