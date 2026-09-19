@@ -175,14 +175,115 @@ test("handoff MOVES the intent but never the authority: envelope dies, new holde
   //    envelope check denies before the substrate is ever consulted.
   assert.equal(rt.isRevoked(carriedCap), true); // the token is dead, though a1's slot table still names it
   assert.equal(await asyncCode(sys.call(intent, slot, { v: 2 })), "E_NO_CAP");
+  assert.equal(intent.ownerEpoch, 2); // HO-1: the epoch moves with the owner
   const fact = evs(rt, "intent_handoff").at(-1);
   assert.equal(fact.to, a2.id);
   assert.equal(fact.envelope, "revoked");
   assert.deepEqual(fact.slots, [slot]);
+  assert.equal(fact.ownerEpoch, 2);
   // 3. the new holder re-earns authority explicitly, on its own slot table
   const slot2 = sys.grantFor(intent, server, "t");
   const { result } = await sys.call(intent, slot2, { v: 42 });
   assert.equal(result, 42);
+});
+
+/* ---------- S2.1 / CO-5: obligation binding precedes the effect ---------- */
+
+function contractHarness(contract, { budget = null } = {}) {
+  const rt = new Runtime();
+  const sys = new AgentSystem(rt);
+  let hits = 0;
+  const { server } = rt.serve("tool-svc", "t", async (a) => {
+    hits += 1;
+    return { receipt: `did:${a.job ?? "?"}` };
+  });
+  const agent = sys.register("planner");
+  const intent = sys.open(agent, { goal: { outcome: "book trip" }, budget, contract });
+  const slot = sys.grantFor(intent, server, "t");
+  return { rt, sys, agent, server, intent, slot, hits: () => hits };
+}
+
+test("contract path: bound ok calls discharge exactly the obligations they were bound to", async () => {
+  const { rt, sys, intent, slot } = contractHarness(["flight", "hotel"]);
+  const { xact: x1 } = await sys.call(intent, slot, { job: 1 }, { for: ["flight"] });
+  const { xact: x2 } = await sys.call(intent, slot, { job: 2 }, { for: ["hotel"] });
+  const d1 = evs(rt, "intent_dispatch").at(-2);
+  assert.deepEqual(d1.obligationIds, ["flight"]);
+  assert.equal(d1.ownerEpoch, 1);
+  assert.equal(d1.contractRevision, 0);
+  await sys.complete(intent, [{ xact: x1, obligation: "flight" }, { xact: x2, obligation: "hotel" }]);
+  assert.equal(intent.state, "completed");
+  assert.deepEqual(evs(rt, "intent_complete").at(-1).contract, ["flight", "hotel"]);
+});
+
+test("CO-5: a success bound to A can never be re-labelled into obligation B", async () => {
+  const { rt, sys, intent, slot } = contractHarness(["flight", "hotel"]);
+  const { xact } = await sys.call(intent, slot, { job: 1 }, { for: ["flight"] });
+  assert.equal(await asyncCode(sys.complete(intent, [{ xact, obligation: "hotel" }])), "E_NO_EVIDENCE");
+  assert.ok(evs(rt, "completion_denied").at(-1).why.includes("bindings precede effects"));
+  assert.equal(intent.state, "active"); // refusal leaves it claimable (COMPLETING → ACTIVE)
+});
+
+test("CO-5: an anonymous success cannot be renamed into a receipt at completion", async () => {
+  const { sys, intent, slot } = contractHarness(["flight"]);
+  const { xact } = await sys.call(intent, slot, { job: 1 }); // no for: — legal, but pays for nothing
+  assert.equal(await asyncCode(sys.complete(intent, [{ xact, obligation: "flight" }])), "E_NO_EVIDENCE");
+});
+
+test("CO-5: binding an unknown obligation is refused BEFORE the effect dispatches", async () => {
+  const { rt, sys, intent, slot, hits } = contractHarness(["flight"]);
+  assert.equal(await asyncCode(sys.call(intent, slot, { job: 1 }, { for: ["not-in-contract"] })), "E_INVAL");
+  assert.equal(hits(), 0); // nothing reached the tool
+  assert.equal(evs(rt, "intent_dispatch").length, 0); // and no binding fact exists to select later
+  assert.equal(evs(rt, "intent_call").at(-1).outcome, "denied");
+});
+
+test("CO-5: receipts need minOccurrences DISTINCT discharges; re-claiming one xact is not two", async () => {
+  const { sys, intent, slot } = contractHarness([{ id: "flight", minOccurrences: 2 }]);
+  const { xact: x1 } = await sys.call(intent, slot, { job: 1 }, { for: ["flight"] });
+  assert.equal(await asyncCode(sys.complete(intent, [{ xact: x1, obligation: "flight" }])), "E_NO_EVIDENCE");
+  assert.equal(await asyncCode(sys.complete(intent, [{ xact: x1, obligation: "flight" }, { xact: x1, obligation: "flight" }])), "E_NO_EVIDENCE");
+  const { xact: x2 } = await sys.call(intent, slot, { job: 2 }, { for: ["flight"] });
+  await sys.complete(intent, [{ xact: x1, obligation: "flight" }, { xact: x2, obligation: "flight" }]);
+  assert.equal(intent.state, "completed");
+});
+
+test("CO-1/CO-5: append-only amend — work done before an obligation is born can never pay for it", async () => {
+  const { rt, sys, intent, slot } = contractHarness(["flight"]);
+  const { xact: x1 } = await sys.call(intent, slot, { job: 1 }, { for: ["flight"] });
+  sys.amend(intent, ["hotel"]); // same owner, same epoch — revision is what orders this
+  assert.equal(intent.contractRevision, 1);
+  assert.deepEqual(evs(rt, "contract_amend").at(-1).added, ["hotel"]);
+  assert.throws(() => sys.amend(intent, ["hotel"]), (e) => e.code === "E_INVAL"); // append-only: no dupes
+  // flight is met, hotel is not:
+  assert.equal(await asyncCode(sys.complete(intent, [{ xact: x1, obligation: "flight" }])), "E_NO_EVIDENCE");
+  // and the pre-amend call cannot be dressed up for the new obligation:
+  assert.equal(await asyncCode(
+    sys.complete(intent, [{ xact: x1, obligation: "flight" }, { xact: x1, obligation: "hotel" }])
+  ), "E_NO_EVIDENCE");
+  // the honest path: work dispatched AFTER the promise
+  const { xact: x2 } = await sys.call(intent, slot, { job: 2 }, { for: ["hotel"] });
+  await sys.complete(intent, [{ xact: x1, obligation: "flight" }, { xact: x2, obligation: "hotel" }]);
+  assert.equal(intent.state, "completed");
+});
+
+test("HO-4 across handoff: old-epoch receipts pay only for old-epoch promises", async () => {
+  const { rt, sys, server, intent, slot } = contractHarness(["flight"]);
+  const { xact: x1 } = await sys.call(intent, slot, { job: 1 }, { for: ["flight"] });
+  const a2 = sys.register("relief");
+  sys.handoff(intent, a2);
+  sys.amend(intent, ["hotel"]); // born at epoch 2 — after the handoff
+  const s2 = sys.grantFor(intent, server, "t");
+  const { xact: x2 } = await sys.call(intent, s2, { job: 2 }, { for: ["hotel"] });
+  const d2 = evs(rt, "intent_dispatch").at(-1);
+  assert.equal(d2.ownerEpoch, 2);
+  // the epoch-1 receipt cannot pay the epoch-2 promise:
+  assert.equal(await asyncCode(
+    sys.complete(intent, [{ xact: x1, obligation: "flight" }, { xact: x1, obligation: "hotel" }])
+  ), "E_NO_EVIDENCE");
+  // x1 still pays flight (born epoch 1); hotel needs the epoch-2 call
+  await sys.complete(intent, [{ xact: x1, obligation: "flight" }, { xact: x2, obligation: "hotel" }]);
+  assert.equal(intent.state, "completed");
 });
 
 /* ---------- suspend / resume on another model ---------- */

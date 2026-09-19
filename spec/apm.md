@@ -172,7 +172,10 @@ CO-1  Every intent carries a CompletionContract, frozen at creation
       the contract names (default: an approval obligation — erasing a
       requirement is a decision someone must own). Amend/supersede
       bumps `contractRevision` and reopens COMPLETING checks for
-      previously satisfied obligations.
+      previously satisfied obligations. [append-only amend + revision
+      bump pinned in S2.1: `append-only amend — work done before an
+      obligation is born can never pay for it`; supersede/waiver
+      planned (§8 item 5)]
 CO-2  The contract is a finite set of obligations, each:
         { id, kind, matcher, minOccurrences, bornRevision }
       where `bornRevision` is the contractRevision at which the
@@ -206,7 +209,10 @@ CO-5  Obligation binding precedes the effect. The dispatch fact of an
       at completion time is structurally impossible, because no
       completion-time act can write a dispatch-time fact. Without this
       rule the contract has no teeth: any successful call could be
-      renamed into any receipt later. [planned]
+      renamed into any receipt later. [pinned in S2.1: `a success bound
+      to A can never be re-labelled into obligation B`, `an anonymous
+      success cannot be renamed into a receipt at completion`, `binding
+      an unknown obligation is refused BEFORE the effect dispatches`]
 ```
 
 `goal: "book trip"` with obligations
@@ -269,7 +275,8 @@ enough to order obligations against work: a contract can grow *within*
 one owner's tenure.
 
 ```
-HO-1  handoff: envelope revoked [pinned], epoch++, new owner starts
+HO-1  handoff: envelope revoked [pinned], epoch++ [pinned in S2.1:
+        the handoff test asserts ownerEpoch], new owner starts
         with ZERO authority; re-entry only via grantFor (OT-1's lawful
         creation bridge).
 HO-2  In-flight calls (dispatched at epoch e, settling after a
@@ -289,6 +296,9 @@ HO-4  Discharge admission: a receipt stamped (epoch e, revision r)
         grew under a later owner or under the SAME owner after the
         call. Receipts NEVER confer authority and never satisfy
         approvals/attention granted under another epoch.
+        [pinned in S2.1: `append-only amend — work done before an
+        obligation is born can never pay for it`, `HO-4 across
+        handoff: old-epoch receipts pay only for old-epoch promises`]
 HO-5  An approval grant is bound to (intent, epoch, scope): a
         handoff invalidates unconsumed grants; the human's yes was
         about *that* principal doing *that* work.

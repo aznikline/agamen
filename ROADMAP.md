@@ -93,6 +93,17 @@ policies over split parentage + supersede/waiver; epoch/revision
 stamping; AttentionRequest. All inside `src/intent.js`. No runtime
 features ride along.
 
+**S2.1 progress** (2026-09-19): dispatch-time obligation binding
+landed (spec §8 item 4, started out of order at the owner's request):
+`receipt` obligations declared at open/fork/delegate, appended only
+via `amend` (bumps `contractRevision`; supersede/waiver still
+planned); every dispatch journals
+`{intent, ownerEpoch, contractRevision, obligationIds, xact}`;
+`complete()` claims only SELECT bindings; `handoff` bumps
+`ownerEpoch`. 20/20 APM tests (7 new, all negative-first). Still
+open: items 1–3 (ST-3 privatization, ST-2 replay events, DC-5 closure
+gate), approval/closure/context obligation kinds, join policies.
+
 # Track E — enforcement
 
 ## M0 — v0 invariant core (done, 2026-09-19)

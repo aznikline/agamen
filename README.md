@@ -15,7 +15,7 @@ must be enforced). Agate *enforces*; Agamen *defines what should exist*.
 
 > Status: **M1.6** — v1.6 substrate: authority-handle split (ActorId /
 > ActorControl / MailboxCap), consent-gated slots, clone-or-fail value
-> discipline, private hash-chained ledger; 49 invariant + 13 APM tests;
+> discipline, private hash-chained ledger; 49 invariant + 20 APM tests;
 > Node ≥ 20, dependency-free. M2 (approval leases) stays blocked by
 > design.
 > [Why "Agamen"?](docs/name.md) · [Design thesis](docs/thesis.md) ·
@@ -112,19 +112,23 @@ substrate; the layer owns lifecycle facts — and the gate is provable:
 ```js
 const sys = new AgentSystem(rt);
 const planner = sys.register("planner", { model: "m-alpha" });
-const intent = sys.open(planner, { goal: { outcome: "report" }, budget: { calls: 10 } });
+const intent = sys.open(planner, {
+  goal: { outcome: "report" }, budget: { calls: 10 }, contract: ["report_written"],
+});
 const slot = sys.grantFor(intent, server, "search"); // envelope cap, budget membrane
-const { xact, result } = await sys.call(intent, slot, { q: "…" });
-await sys.complete(intent, [{ xact }]); // refuses unless the ledger backs the xact
+const { xact } = await sys.call(intent, slot, { q: "…" }, { for: ["report_written"] });
+// the binding is recorded AS THE CALL LEAVES (CO-5); a completion claim
+// can only select a binding the ledger already wrote — never re-label.
+await sys.complete(intent, [{ xact, obligation: "report_written" }]);
 ```
 
 ## Layout
 
 ```
 src/runtime.js                     the substrate (actors/caps/membranes/journal/schedule)
-src/intent.js                      S1: the Agent Process Model experiment (Track S)
+src/intent.js                      the Agent Process Model (Track S; spec/apm.md)
 test/runtime.test.mjs              invariant suite (49 tests)
-test/intent.test.mjs               APM lifecycle + negative suite (13 tests)
+test/intent.test.mjs               APM lifecycle + negative suite (20 tests)
 bench/run.mjs                      tier 1-2 measurement harness (paired protocol)
 bench/baseline.md                  fitted per-invoke cost model (M1.6 snapshot)
 spec/invariants.md                 normative invariants + threat model + acceptance

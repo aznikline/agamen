@@ -1,5 +1,10 @@
 /**
- * Agamen APM experiment — the Agent Process Model (semantic track S1).
+ * Agamen APM — the Agent Process Model (semantic track S).
+ *
+ * Conformance target: spec/apm.md. Landed so far: S1's lifecycle +
+ * evidence gate, and S2.1's CO-5 dispatch-time obligation binding
+ * (receipt-kind CompletionContracts, append-only amend, ownerEpoch /
+ * contractRevision stamps on every dispatch).
  *
  * The question this layer answers: *which existing OS abstraction fails
  * first under agent workloads?* The process. A long-running, delegable,
@@ -36,6 +41,40 @@ const nowIso = () => new Date().toISOString();
 
 let nextIntent = 1;
 let nextAgent = 1;
+
+/* ---------- completion contracts (spec/apm.md §3, CO-5) ----------
+ * Obligations are declared at creation and may only GROW (append-only
+ * amend); retiring one is a separate act (supersede/waiver, §8 item 5)
+ * that is deliberately NOT implemented, because erasing a requirement is
+ * a decision someone must own. Dispatch-time binding is what gives the
+ * contract teeth: an obligation id may name a call only as the call
+ * leaves, never after its result is observable. */
+
+function normalizeContract(list) {
+  if (!Array.isArray(list)) throw new SubstrateError("E_INVAL", "contract must be a list of obligations");
+  const out = [];
+  const seen = new Set();
+  for (const raw of list) {
+    let ob;
+    try {
+      ob = typeof raw === "string" ? { id: raw } : structuredClone(raw);
+    } catch {
+      throw new SubstrateError("E_INVAL", "obligations must be plain data");
+    }
+    const id = ob?.id;
+    if (typeof id !== "string" || id === "") throw new SubstrateError("E_INVAL", "obligation needs a string id");
+    const kind = ob.kind ?? "receipt";
+    if (kind !== "receipt") {
+      throw new SubstrateError("E_INVAL", `obligation kind '${kind}' lands with spec §8 item 2; 'receipt' only in this slice`);
+    }
+    const min = ob.minOccurrences ?? 1;
+    if (!Number.isInteger(min) || min < 1) throw new SubstrateError("E_INVAL", "minOccurrences must be a positive integer");
+    if (seen.has(id)) throw new SubstrateError("E_INVAL", `duplicate obligation id '${id}'`);
+    seen.add(id);
+    out.push({ id, kind: "receipt", matcher: ob.matcher ?? null, minOccurrences: min });
+  }
+  return out;
+}
 
 /* ---------- contexts: the new memory model ----------
  * A context is a plain-data snapshot. Lineage = the ordered record of
@@ -119,9 +158,14 @@ export class Intent {
   context; // own Context (forked from the parent's snapshot when created)
   state = "open"; // open | active | suspended | revoked | completed | failed
   evidence = [];
+  // spec §5: two independent monotonic counters — a handoff must not be
+  // confused with a contract change, and neither with the passage of time
+  ownerEpoch = 1; // +1 per handoff (HO-1)
+  contractRevision = 0; // +1 per append-only amend (CO-1)
+  contract = []; // {id, kind, matcher, minOccurrences, bornRevision, bornEpoch}
   openedAt = nowIso();
 
-  constructor({ agent, goal, budget = null, deadline = null, approval = "not_required", contextSeed = {} }) {
+  constructor({ agent, goal, budget = null, deadline = null, approval = "not_required", contextSeed = {}, contract = [] }) {
     this.id = `i${nextIntent++}`;
     this.agent = agent;
     this.goal = cloneContext(goal);
@@ -129,6 +173,7 @@ export class Intent {
     this.deadline = deadline;
     this.approval = approval;
     this.context = new Context(contextSeed, this.id);
+    this.contract = normalizeContract(contract).map((o) => ({ ...o, bornRevision: 0, bornEpoch: 1 }));
   }
 }
 
@@ -147,17 +192,20 @@ export class AgentSystem {
     return new AgentExecution(this, label, opts);
   }
 
-  open(agent, { goal, budget = null, deadline = null, approval = "not_required", context = {} } = {}) {
+  open(agent, { goal, budget = null, deadline = null, approval = "not_required", context = {}, contract = [] } = {}) {
     if (!goal || typeof goal !== "object") throw new SubstrateError("E_INVAL", "goal must describe the requested outcome");
-    const intent = new Intent({ agent, goal, budget, deadline, approval, contextSeed: context });
+    const intent = new Intent({ agent, goal, budget, deadline, approval, contextSeed: context, contract });
     this.#track(agent, intent);
-    this.#fact({ t: "intent_open", intent: intent.id, agent: agent.id, goal, budget, deadline, approval });
+    this.#fact({
+      t: "intent_open", intent: intent.id, agent: agent.id, goal, budget, deadline, approval,
+      contract: intent.contract.map((o) => o.id),
+    });
     return intent;
   }
 
   /** Fork: a child intent on the SAME agent; its context branches from a
    *  copy of the parent's snapshot. */
-  fork(parentIntent, { goal, budget = null, deadline = null, approval } = {}) {
+  fork(parentIntent, { goal, budget = null, deadline = null, approval, contract = [] } = {}) {
     this.#requireLive(parentIntent);
     const child = new Intent({
       agent: parentIntent.agent,
@@ -166,6 +214,7 @@ export class AgentSystem {
       deadline,
       approval: approval ?? parentIntent.approval,
       contextSeed: parentIntent.context.snapshot(),
+      contract,
     });
     child.parent = parentIntent;
     parentIntent.children.add(child.id);
@@ -176,7 +225,7 @@ export class AgentSystem {
 
   /** Delegate: a NEW child intent executed by another agent; the parent
    *  keeps ownership and receives the merged result. */
-  delegate(parentIntent, targetAgent, { goal, budget = null, deadline = null, approval } = {}) {
+  delegate(parentIntent, targetAgent, { goal, budget = null, deadline = null, approval, contract = [] } = {}) {
     this.#requireLive(parentIntent);
     const child = new Intent({
       agent: targetAgent,
@@ -185,6 +234,7 @@ export class AgentSystem {
       deadline,
       approval: approval ?? parentIntent.approval,
       contextSeed: parentIntent.context.snapshot(),
+      contract,
     });
     child.parent = parentIntent;
     parentIntent.children.add(child.id);
@@ -194,6 +244,28 @@ export class AgentSystem {
       from: parentIntent.agent.id, to: targetAgent.id,
     });
     return child;
+  }
+
+  /** Append-only contract amendment (CO-1): adds obligations stamped with
+   *  the bumped contractRevision and current ownerEpoch. There is no
+   *  removal path here on purpose — retiring a requirement is
+   *  supersede/waiver (§8 item 5), a separate owned act. */
+  amend(intent, obligations) {
+    this.#requireLive(intent);
+    const added = normalizeContract(obligations);
+    const have = new Set(intent.contract.map((o) => o.id));
+    for (const ob of added) {
+      if (have.has(ob.id)) throw new SubstrateError("E_INVAL", `obligation '${ob.id}' is already in the contract`);
+    }
+    intent.contractRevision += 1;
+    for (const ob of added) {
+      intent.contract.push({ ...ob, bornRevision: intent.contractRevision, bornEpoch: intent.ownerEpoch });
+    }
+    this.#fact({
+      t: "contract_amend", intent: intent.id, revision: intent.contractRevision,
+      epoch: intent.ownerEpoch, added: added.map((o) => o.id),
+    });
+    return intent.contract.map((o) => o.id);
   }
 
   /** Handoff: the INTENT moves, its AUTHORITY does not. Goal, context
@@ -218,9 +290,10 @@ export class AgentSystem {
     }
     const slots = intent.envelope.map((e) => e.slot);
     intent.envelope = []; // new holder must re-grant before it can call
+    intent.ownerEpoch += 1; // HO-1: work and promises order against the epoch they were made under
     this.#fact({
       t: "intent_handoff", intent: intent.id, from: from.id, to: targetAgent.id,
-      envelope: "revoked", slots,
+      envelope: "revoked", slots, ownerEpoch: intent.ownerEpoch,
     });
     return intent;
   }
@@ -278,8 +351,11 @@ export class AgentSystem {
   /** The mediated call: lifecycle, approval, budget and envelope are
    *  checked HERE; rights, deadline, membranes and cloning are enforced
    *  THERE (the substrate). correlationId = intent id is what makes
-   *  evidence provable later. */
-  async call(intent, slot, args) {
+   *  evidence provable later. `for:` names the obligations the call is
+   *  made AGAINST — chosen before the effect leaves, never after
+   *  (CO-5); an anonymous call is legal but can never be re-labelled
+   *  into a receipt at completion time. */
+  async call(intent, slot, args, { for: obligationIds = [] } = {}) {
     this.#requireLive(intent);
     const denied = (code, msg) => {
       this.#fact({ t: "intent_call", intent: intent.id, slot, outcome: "denied", code });
@@ -295,6 +371,13 @@ export class AgentSystem {
     if (intent.budget && intent.spent >= intent.budget.calls) {
       denied("E_BUDGET", `intent budget exhausted (${intent.budget.calls} calls)`);
     }
+    if (!Array.isArray(obligationIds)) denied("E_INVAL", "obligation bindings must be a list of ids");
+    const byId = new Map(intent.contract.map((o) => [o.id, o]));
+    for (const oid of obligationIds) {
+      if (!byId.has(oid)) {
+        denied("E_INVAL", `dispatch binds no obligation: '${oid}' is not in ${intent.id}'s contract at revision ${intent.contractRevision}`);
+      }
+    }
     intent.spent += 1; // charged-attempt, mirroring membrane semantics
     let xact = null;
     try {
@@ -305,6 +388,13 @@ export class AgentSystem {
         deadline: intent.deadline,
       });
       xact = req.xact;
+      // The binding fact is written BEFORE any result is observable —
+      // completion claims can only select what this line recorded.
+      this.#fact({
+        t: "intent_dispatch", intent: intent.id, slot, xact,
+        ownerEpoch: intent.ownerEpoch, contractRevision: intent.contractRevision,
+        obligationIds: [...new Set(obligationIds)],
+      });
       const result = await req.promise;
       this.#fact({ t: "intent_call", intent: intent.id, slot, xact, outcome: "ok" });
       return { xact, result };
@@ -328,17 +418,20 @@ export class AgentSystem {
     return parent.context.snapshot();
   }
 
-  /** Complete = evidence, or nothing. At least one item must be backed by
-   *  an actual journaled `ok` invocation correlated to this intent — an
-   *  agent cannot claim it finished. Unbacked items may accompany it but
-   *  are marked unbacked in the intent's record. */
-  async complete(intent, evidence = []) {
+  /** Complete = the contract, or nothing. With a CompletionContract, this
+   *  is the COMPLETING check (ST-1): every claim must SELECT a dispatch
+   *  binding the ledger recorded before any result was observable (CO-5),
+   *  and every obligation needs ≥ minOccurrences distinct discharges.
+   *  With an empty contract the S1 gate remains: at least one ledger-
+   *  backed ok effect — the degenerate one-obligation case. */
+  async complete(intent, claims = []) {
     this.#requireLive(intent);
-    if (!Array.isArray(evidence) || evidence.length === 0) {
+    if (intent.contract.length > 0) return this.#completeAgainstContract(intent, claims);
+    if (!Array.isArray(claims) || claims.length === 0) {
       throw new SubstrateError("E_NO_EVIDENCE", "completion requires at least one evidence item");
     }
     const backed = this.#journalBackedXacts(intent);
-    for (const item of evidence) {
+    for (const item of claims) {
       const isBacked = !!(item && item.xact && backed.has(item.xact));
       if (item && item.xact && !isBacked) {
         throw new SubstrateError("E_NO_EVIDENCE", `evidence xact '${item.xact}' is not a journaled ok call on this intent`);
@@ -350,6 +443,47 @@ export class AgentSystem {
     }
     intent.state = "completed";
     this.#fact({ t: "intent_complete", intent: intent.id, agent: intent.agent.id, evidence: intent.evidence.length });
+    return intent;
+  }
+
+  #completeAgainstContract(intent, claims) {
+    if (!Array.isArray(claims)) {
+      throw new SubstrateError("E_INVAL", "completion takes a list of {xact, obligation} claims");
+    }
+    const backed = this.#journalBackedXacts(intent);
+    const bindings = this.#dispatchBindings(intent);
+    const discharged = new Map(intent.contract.map((o) => [o.id, new Set()]));
+    const refuse = (claim, why) => {
+      this.#fact({ t: "completion_denied", intent: intent.id, claim: claim ?? null, why });
+      throw new SubstrateError("E_NO_EVIDENCE", why);
+    };
+    for (const claim of claims) {
+      const { xact, obligation } = claim ?? {};
+      const bind = xact ? bindings.get(xact) : null;
+      if (!bind) refuse(claim, `claim xact '${xact ?? "—"}' has no dispatch binding on ${intent.id}`);
+      if (!backed.has(xact)) refuse(claim, `dispatch '${xact}' did not settle ok — a failed call discharges nothing`);
+      if (!bind.obligationIds.includes(obligation)) {
+        refuse(claim, `CO-5: '${xact}' was bound at dispatch to [${bind.obligationIds.join(", ") || "anonymous"}], not '${obligation}' — bindings precede effects`);
+      }
+      const ob = intent.contract.find((o) => o.id === obligation);
+      if (ob.bornEpoch > bind.ownerEpoch || ob.bornRevision > bind.contractRevision) {
+        refuse(claim, `HO-4: obligation '${obligation}' was born at (epoch ${ob.bornEpoch}, rev ${ob.bornRevision}) — after the dispatch's (epoch ${bind.ownerEpoch}, rev ${bind.contractRevision}); past work cannot pay for future promises`);
+      }
+      discharged.get(obligation).add(xact);
+    }
+    const unmet = intent.contract
+      .filter((o) => discharged.get(o.id).size < o.minOccurrences)
+      .map((o) => o.id);
+    if (unmet.length) {
+      this.#fact({ t: "completion_denied", intent: intent.id, unmet });
+      throw new SubstrateError("E_NO_EVIDENCE", `unmet obligations: ${unmet.join(", ")}`);
+    }
+    intent.evidence.push(...claims.map((c) => ({ ...cloneOrWrap(c), backed: true })));
+    intent.state = "completed";
+    this.#fact({
+      t: "intent_complete", intent: intent.id, agent: intent.agent.id,
+      contract: intent.contract.map((o) => o.id), evidence: intent.evidence.length,
+    });
     return intent;
   }
 
@@ -387,6 +521,22 @@ export class AgentSystem {
       if (event.t === "invoke" && event.correlationId === intent.id && event.outcome === "ok") set.add(event.xact);
     }
     return set;
+  }
+
+  /* CO-5's read side: what the ledger says each dispatch was FOR. Facts
+   * are the only source — no in-layer cache exists to be re-labelled. */
+  #dispatchBindings(intent) {
+    const m = new Map();
+    for (const { event } of this.rt.journalEntries()) {
+      if (event.t === "intent_dispatch" && event.intent === intent.id) {
+        m.set(event.xact, {
+          obligationIds: event.obligationIds ?? [],
+          ownerEpoch: event.ownerEpoch,
+          contractRevision: event.contractRevision,
+        });
+      }
+    }
+    return m;
   }
 
   #fact(ev) {
