@@ -1,0 +1,11 @@
+{
+  "name": "agent-substrate",
+  "version": "0.0.1",
+  "description": "Actors + object capabilities + membranes + provenance: a userspace incubator for AI-agent execution semantics beyond the OS process model.",
+  "type": "module",
+  "license": "MIT",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "test": "node --test"
+  }
+}
