@@ -9,18 +9,20 @@ normative core is a deterministic boundary — capabilities, stamped identity,
 membranes, provenance — with hardware enforcement deferred to a pluggable
 backend decision ([ROADMAP](ROADMAP.md) M5).
 
-> Status: **M0** — v0 in-memory substrate, ~200 lines, Node ≥ 20, dependency-free.
+> Status: **M1** — v1 substrate with scheduling semantics (deadline / budget
+> / cancel / backpressure), 15 tests, Node ≥ 20, dependency-free.
 > [Why "Agamen"?](docs/name.md) · [Design thesis](docs/thesis.md) ·
 > [Invariants (normative)](spec/invariants.md) · [Evaluation charter](docs/evaluation.md) · [Roadmap](ROADMAP.md)
 
-## The four primitives
+## The five primitives
 
 | Primitive | What it enforces | Invariant |
 |---|---|---|
-| **Actor** | identity + mailbox; sender is substrate-bound, never message-borne | #3, #4 |
+| **Actor** | identity + bounded mailbox; sender is substrate-bound, never message-borne; saturation sheds or blocks | #3, #4 |
 | **Capability** | designation + rights; monotonic attenuation; subtree revocation | #1, #2, #6 |
 | **Membrane** | policy between model and tool: vetoes, budgets, rewriting | #11 |
-| **Provenance** | hash-chained journal; every call records `(actor, tool, argsHash, resultHash)` | #10 |
+| **Provenance** | hash-chained journal; every call records `(actor, tool, argsHash, resultHash)`, denials under the same xact | #10 |
+| **Schedule** | deadline, budget, cancellation as substrate states; expired requests never execute; outcomes `ok/fail/cancelled/timeout` are distinct | #9 |
 
 ## Quick start
 
@@ -45,11 +47,22 @@ rt.revoke(server.slots.get("search")); // kills every derived cap instantly
 rt.journal.verify(); // provenance chain, tamper-evident
 ```
 
+M1 adds scheduling as substrate states — an expired request never runs, and
+every completion outcome is journaled under its xact:
+
+```js
+const { xact, promise } = rt.request(agent, "search", { q: "…" }, { deadline: t0 + 50 });
+rt.cancel(xact);       // pending result is discarded, never delivered
+// outcomes in the journal: ok | fail | cancelled | timeout; queue: shed | expire
+```
+
 ## Layout
 
 ```
-src/runtime.js                     the substrate (actors/caps/membranes/journal)
+src/runtime.js                     the substrate (actors/caps/membranes/journal/schedule)
 test/runtime.test.mjs              invariant suite
+bench/run.mjs                      tier 1-2 measurement harness
+bench/baseline.md                  fitted per-invoke cost model (M1)
 spec/invariants.md                 normative invariants + threat model + acceptance
                                    (inherited from agate spec 13, ids preserved)
 kernel/uapi/                       reference ABI seed (capability rights algebra)

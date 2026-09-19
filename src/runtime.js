@@ -1,8 +1,17 @@
 /**
- * Agamen v0 — actors + object capabilities + membranes + provenance.
+ * Agamen v1 — actors + object capabilities + membranes + provenance +
+ * scheduling semantics (M1).
+ *
+ * Deadline, budget, and cancellation are substrate states, not advisory
+ * conventions: a request whose deadline passed is denied before the handler
+ * runs; a result that lands late or cancelled is never delivered; a full
+ * mailbox sheds or blocks explicitly; every completion state is journaled
+ * under the request's xact (spec 13 #9). Enforcement is cooperative — a
+ * running handler is never preempted in-process; preemption arrives with
+ * the M3 transport boundary.
  *
  * The in-process reference substrate for the normative invariants in
- * spec/invariants.md (inherited from agate spec 13; ids preserved). v0 is
+ * spec/invariants.md (inherited from agate spec 13; ids preserved). v1 is
  * single-threaded; caller identity is a passed actor reference, not a
  * transport stamp — every deviation from kernel-grade enforcement is flagged
  * inline and tracked in ROADMAP.md.
@@ -109,16 +118,21 @@ export const policy = (fn, msg = "rejected by policy") => (ctx) => {
   return ctx.args;
 };
 
-/* ---------- Actor: identity + capability table + mailbox ----------
+/* ---------- Actor: identity + capability table + bounded mailbox ----------
  * Invariant (spec 13 #1 zero ambient authority): a new actor's capability
- * table is empty; everything arrives by explicit grant. */
+ * table is empty; everything arrives by explicit grant.
+ * Backpressure is per-actor policy: onFull "shed" rejects the sender with
+ * E_SHED, "block" parks the send until recv frees a slot. */
 
 export class Actor {
-  constructor(id, label) {
+  constructor(id, label, { mailbox = 64, onFull = "shed" } = {}) {
     this.id = id;
     this.label = label;
     this.slots = new Map();
     this.mbox = [];
+    this.mboxCap = mailbox;
+    this.onFull = onFull;
+    this.mboxWaiters = [];
   }
 
   hold(slot) {
@@ -136,10 +150,30 @@ export class Runtime {
   journal = new Provenance();
   #nextActor = 1;
   #xact = 0;
+  #msg = 0;
+  #now;
+  #journaling;
+  #pending = new Map(); // request xact -> { cancelled }
+  #queued = new Map();  // mailbox xact -> { actor, waiter? }
 
-  spawn(label) {
-    const a = new Actor(this.#nextActor++, label ?? null);
-    this.journal.append({ t: "spawn", actor: a.id, label: a.label });
+  /** `journal:false` is a measurement seam only (docs/evaluation.md tier 1:
+   *  "journal on/off"); every other substrate decision is unaffected. */
+  constructor({ now = () => globalThis.performance.now(), journal = true } = {}) {
+    this.#now = now;
+    this.#journaling = journal;
+  }
+
+  #append(event) {
+    if (this.#journaling) this.journal.append(event);
+  }
+
+  #nowMs() {
+    return this.#now();
+  }
+
+  spawn(label, opts = {}) {
+    const a = new Actor(this.#nextActor++, label ?? null, opts);
+    this.#append({ t: "spawn", actor: a.id, label: a.label });
     return a;
   }
 
@@ -160,7 +194,7 @@ export class Runtime {
     const src = from.hold(fromSlot);
     const derived = src.attenuate({ rights, membranes });
     to.slots.set(toSlot, derived);
-    this.journal.append({
+    this.#append({
       t: "grant",
       from: from.id,
       to: to.id,
@@ -173,39 +207,176 @@ export class Runtime {
 
   revoke(cap) {
     cap.revoke();
-    this.journal.append({ t: "revoke", tool: cap.name });
+    this.#append({ t: "revoke", tool: cap.name });
   }
 
-  /** Capability-mediated tool invocation, recorded as the provenance quad
-   *  (actor, tool, argsHash, resultHash) correlated by xact id. */
-  async invoke(actor, slot, args) {
-    const cap = actor.hold(slot);
-    if (cap.revoked) throw new SubstrateError("E_REVOKED", `capability '${cap.name}' is revoked`);
-    if (!cap.rights.has("send")) throw new SubstrateError("E_RIGHTS", "missing 'send' right");
+  /** Mediated call, admitted under explicit lifecycle states. Returns
+   *  { xact, promise }. Denials carry the same xact as successes would,
+   *  so the journal correlates attempt and outcome (spec 13 #10). */
+  request(actor, slot, args, { deadline = null, signal = null } = {}) {
     const xact = `x${++this.#xact}`;
-    let ctx = { actor, cap, args, xact };
-    for (const m of cap.membranes) {
-      const next = m(ctx);
-      if (next !== undefined) ctx = { ...ctx, args: next };
+    const cap = actor.hold(slot);
+    const deny = (code, msg) => {
+      this.#append({ t: "invoke_denied", xact, actor: actor.id, tool: cap.name, code });
+      throw new SubstrateError(code, msg);
+    };
+    if (cap.revoked) deny("E_REVOKED", `capability '${cap.name}' is revoked`);
+    if (!cap.rights.has("send")) deny("E_RIGHTS", "missing 'send' right");
+    if (signal?.aborted) deny("E_CANCELLED", "cancelled before admission");
+    if (deadline !== null && this.#nowMs() >= deadline) {
+      deny("E_DEADLINE", "deadline passed before admission; handler not executed");
     }
-    const argsHash = sha256(ctx.args);
-    const result = await cap.target.handler(ctx.args, ctx);
-    const resultHash = sha256(result);
-    this.journal.append({ t: "invoke", actor: actor.id, tool: cap.name, xact, argsHash, resultHash });
-    return result;
+
+    let ctx = { actor, cap, args, xact };
+    try {
+      for (const m of cap.membranes) {
+        const next = m(ctx);
+        if (next !== undefined) ctx = { ...ctx, args: next };
+      }
+    } catch (e) {
+      this.#append({ t: "invoke_denied", xact, actor: actor.id, tool: cap.name, code: e.code ?? "E_MEMBRANE" });
+      throw e;
+    }
+
+    // hashing is journal work: when the measurement seam turns the journal
+    // off, its cost must leave the measurement too (docs/evaluation.md tier 1)
+    const argsHash = this.#journaling ? sha256(ctx.args) : null;
+    const journalEv = (outcome, result) => {
+      if (!this.#journaling) return;
+      const ev = { t: "invoke", xact, actor: actor.id, tool: cap.name, outcome, argsHash };
+      if (result !== undefined) ev.resultHash = sha256(result);
+      this.journal.append(ev);
+    };
+
+    const rec = { cancelled: false };
+    this.#pending.set(xact, rec);
+    if (signal) signal.addEventListener("abort", () => this.cancel(xact), { once: true });
+
+    let resolve_, reject_;
+    const promise = new Promise((res, rej) => { resolve_ = res; reject_ = rej; });
+
+    let h;
+    try {
+      h = cap.target.handler(ctx.args, ctx);
+    } catch (err) {
+      this.#pending.delete(xact);
+      journalEv("fail");
+      throw err;
+    }
+
+    Promise.resolve(h).then(
+      (result) => {
+        this.#pending.delete(xact);
+        if (rec.cancelled) {
+          journalEv("cancelled");
+          reject_(new SubstrateError("E_CANCELLED", `xact ${xact} cancelled; result discarded`));
+        } else if (deadline !== null && this.#nowMs() > deadline) {
+          journalEv("timeout");
+          reject_(new SubstrateError("E_TIMEOUT", `xact ${xact} completed past deadline; result not delivered`));
+        } else {
+          journalEv("ok", result);
+          resolve_(result);
+        }
+      },
+      (err) => {
+        this.#pending.delete(xact);
+        journalEv(rec.cancelled ? "cancelled" : "fail");
+        reject_(err);
+      }
+    );
+
+    return { xact, promise };
   }
 
-  /** Sender stamping: `sender` is bound by the runtime from the caller
-   *  reference and is never read from message content. The kernel version
-   *  replaces the reference with an EL0-unforgeable stamp (spec 13 #4). */
-  tell(from, to, msg) {
-    to.mbox.push({ sender: from.id, msg });
-    this.journal.append({ t: "tell", from: from.id, to: to.id });
+  /** Convenience over request(); throws/rejects with the substrate code. */
+  async invoke(actor, slot, args, opts = {}) {
+    return this.request(actor, slot, args, opts).promise;
+  }
+
+  /** Cancel by xact id. A pending request never delivers its result (the
+   *  handler is not preempted — its output is discarded and journaled); a
+   *  queued or blocked message is removed before delivery. */
+  cancel(xact) {
+    const req = this.#pending.get(xact);
+    if (req) {
+      req.cancelled = true;
+      this.#append({ t: "cancel", xact });
+      return true;
+    }
+    const q = this.#queued.get(xact);
+    if (!q) return false;
+    this.#queued.delete(xact);
+    this.#append({ t: "cancel", xact });
+    if (q.waiter) {
+      const i = q.actor.mboxWaiters.indexOf(q.waiter);
+      if (i >= 0) q.actor.mboxWaiters.splice(i, 1);
+      q.waiter.reject(new SubstrateError("E_CANCELLED", `blocked message ${xact} cancelled`));
+    } else {
+      const i = q.actor.mbox.findIndex((m) => m.xact === xact);
+      if (i >= 0) q.actor.mbox.splice(i, 1);
+    }
+    return true;
+  }
+
+  /** Sender stamping + backpressure. `sender` is bound by the runtime from
+   *  the caller reference and is never read from message content (spec 13
+   *  #4; the kernel version replaces the reference with an EL0-unforgeable
+   *  stamp). Returns true when enqueued, a Promise when the full mailbox
+   *  blocks, and throws E_SHED when the actor sheds. Queued messages are
+   *  checked for expiry at delivery, not at send. */
+  tell(from, to, msg, { deadline = null, xact = null } = {}) {
+    xact = xact ?? `m${++this.#msg}`;
+    if (to.mbox.length >= to.mboxCap) {
+      if (to.onFull === "block") {
+        let w;
+        const p = new Promise((resolve, reject) => {
+          w = { sender: from.id, msg, deadline, xact, resolve, reject };
+        });
+        to.mboxWaiters.push(w);
+        this.#queued.set(xact, { actor: to, waiter: w });
+        this.#append({ t: "tell_blocked", xact, from: from.id, to: to.id });
+        return p;
+      }
+      this.#append({ t: "shed", xact, from: from.id, to: to.id });
+      throw new SubstrateError("E_SHED", `mailbox of '${to.label ?? to.id}' is full (${to.mboxCap})`);
+    }
+    to.mbox.push({ sender: from.id, msg, xact, deadline });
+    this.#queued.set(xact, { actor: to });
+    this.#append({ t: "tell", xact, from: from.id, to: to.id });
+    return true;
   }
 
   recv(actor) {
-    const m = actor.mbox.shift() ?? null;
-    if (m) this.journal.append({ t: "recv", actor: actor.id, sender: m.sender });
-    return m;
+    while (actor.mbox.length) {
+      const m = actor.mbox[0];
+      if (m.deadline !== null && this.#nowMs() >= m.deadline) {
+        actor.mbox.shift();
+        this.#queued.delete(m.xact);
+        this.#append({ t: "expire", xact: m.xact, actor: actor.id });
+        continue;
+      }
+      actor.mbox.shift();
+      this.#queued.delete(m.xact);
+      this.#append({ t: "recv", actor: actor.id, sender: m.sender, xact: m.xact });
+      this.#drainWaiters(actor);
+      return m;
+    }
+    return null;
+  }
+
+  #drainWaiters(actor) {
+    while (actor.mboxWaiters.length && actor.mbox.length < actor.mboxCap) {
+      const w = actor.mboxWaiters.shift();
+      this.#queued.delete(w.xact);
+      if (w.deadline !== null && this.#nowMs() >= w.deadline) {
+        this.#append({ t: "expire", xact: w.xact, actor: actor.id });
+        w.reject(new SubstrateError("E_DEADLINE", `blocked message ${w.xact} expired`));
+        continue;
+      }
+      actor.mbox.push({ sender: w.sender, msg: w.msg, xact: w.xact, deadline: w.deadline });
+      this.#queued.set(w.xact, { actor });
+      this.#append({ t: "tell", xact: w.xact, from: w.sender, to: actor.id, unblocked: true });
+      w.resolve(true);
+    }
   }
 }

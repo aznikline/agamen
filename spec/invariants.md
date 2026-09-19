@@ -33,8 +33,8 @@ agents a **deterministic execution boundary**:
 | 6 | **Revocation reachability** — delegation enters the derivation tree; revoked roots kill every descendant. | enforced, tested |
 | 7 | **Memory isolation** *(kernel-only)* — no ungranted reads/writes across spaces. | normative for M5 |
 | 8 | **Pointer safety** *(kernel-only)* — untrusted references validated before dereference. | normative for M5 |
-| 9 | **Explicit completion** — success / failure / cancel / timeout / waiting-approval / waiting-resource are distinct states. | partial (errors typed; states pending M1) |
-| 10 | **Audit completeness** — allows *and* denials at the mediation point are journaled; no bypass path. | enforced (every runtime op journals; denials as errors) |
+| 9 | **Explicit completion** — success / failure / cancel / timeout / waiting-approval / waiting-resource are distinct states. | enforced (M1): `ok` / `fail` / `cancelled` / `timeout` are journaled outcomes; `shed` and `expire` are queue states; approval pending M2 |
+| 10 | **Audit completeness** — allows *and* denials at the mediation point are journaled; no bypass path. | enforced (denials now journaled as `invoke_denied` under the same xact as the attempt) |
 | 11 | **Policy outside the model** — output may request, never widen. | enforced (membranes) |
 | 12 | **Protocol decoupling** — MCP/A2A changes never alter the substrate ABI. | by construction (no wire layer yet) |
 
@@ -49,7 +49,7 @@ agents a **deterministic execution boundary**:
 | replay | xact ids, nonce/expiry, tool-side idempotency |
 | context poisoning | read/write capability split, version lineage, digests, provenance labels |
 | malicious tool service | process/actor isolation, output validation, no reverse ambient authority |
-| DoS / runaway agent | membranes with budgets, deadlines, cancel, backpressure (M1) |
+| DoS / runaway agent | membranes with budgets, deadlines, cancel, backpressure (**M1: enforced** — deadline admission, xact cancel, mailbox shed/block) |
 | post-approval substitution | approval binds args hash + code/context version (M2) |
 | audit overwrite/tampering | hash chain (v0), export + signing batches (later) |
 
@@ -64,8 +64,8 @@ agents a **deterministic execution boundary**:
 | audit completeness | — *provenance* (quad + tamper-evidence) |
 | atomic spawn | pending M5 (kernel backend) |
 | pointer fault | pending M5 |
-| lifecycle | pending M1 |
-| deadline/cancel | pending M1 |
+| lifecycle | `test/runtime.test.mjs` — *lifecycle* (expire/cancel at delivery; ok/fail outcomes distinct, spec #9) |
+| deadline/cancel | — *deadline* denied pre-execution + late result withheld; *cancel* by xact id and pre-aborted signal |
 | context isolation | pending M4 |
 | approval binding | pending M2 |
 | protocol boundary | pending (no wire layer) |

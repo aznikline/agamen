@@ -11,14 +11,18 @@ decision (M5). Each milestone is gated by the acceptance table in
 Actors, capability derivation + subtree revocation, membranes, hash-chained
 provenance. 7 tests green. Invariants #1 #2 #3 #6 #10 #11 enforced in-process.
 
-## M1 — scheduling semantics as a substrate object
+## M1 — scheduling semantics as a substrate object (done, 2026-09-19)
 
-Deadline, budget, and cancellation become first-class on the actor/mailbox
-path (not an advisory convention): a request whose deadline passed must not
-execute server-side; a saturated endpoint must shed or block explicitly, and
-must be cancellable via xact id. Carries over agate's EDF-experiment result
-(P0-1) from paper to practice. Acceptance: deadline/cancel + lifecycle rows, and `bench/baseline.md` with
-the per-invoke cost model fitted (see `docs/evaluation.md`).
+Deadline, budget, and cancellation are first-class on the actor/mailbox path
+(not an advisory convention): a request past its deadline is denied before
+the handler runs and a late result is withheld (`E_DEADLINE`/`E_TIMEOUT`);
+cancellation by xact id discards pending results; saturated mailboxes shed
+(`E_SHED`) or block explicitly. Completion states `ok/fail/cancelled/timeout`
+are journaled (invariant #9); denials carry the same xact (#10). Enforcement
+is cooperative — in-process handlers are not preempted; preemption is an M3
+transport concern. Carries agate's EDF-experiment result (P0-1) from paper to
+practice. Acceptance met: deadline/cancel + lifecycle rows green (15/15
+tests); baseline cost model in `bench/baseline.md`.
 
 ## M2 — approval leases
 
