@@ -846,11 +846,9 @@ test("S2.2a sanitization: a hostile toString cannot suppress a denial fact — f
   assert.equal(await asyncCode(sys.complete(intent, [claim])), "E_NO_EVIDENCE");
   const d = evs(rt, "completion_denied").at(-1);
   assert.ok(d, "the denial fact must land no matter what the claim object wants");
-  assert.equal(d.claim.evil.$notInDomain, "function");
-  assert.equal(d.claim.toString.$notInDomain, "function");
-  assert.equal(d.claim.trap.$notInDomain, "accessor");
-  assert.equal(d.claim.xact, "x999-forged"); // in-domain parts stay honest
-  assert.equal(d.claim.obligation, "flight");
+  assert.equal(d.xact, "x999-forged"); // extracted from the DATA DESCRIPTOR, never through a getter
+  assert.equal(d.obligation, "flight");
+  assert.deepEqual(d.claim, { $untrusted: true }); // accessor-bearing payload: branch-refused whole — fact integrity beats content preservation
   assert.equal(rt.verifyJournal(), true);
   assert.equal(intent.state, "active"); // refused completion changed nothing
 });
@@ -887,5 +885,118 @@ test("S2.2a context: current() hands out a DETACHED ContextVersion — v3 stays 
   assert.equal(v2.version, 2);
   assert.notEqual(v2.snapshot, v0.snapshot); // distinct detached values — a context obligation binds ONE
   assert.equal(v2.lineageRef.at(-1).toVersion, 2);
+  assert.equal(rt.verifyJournal(), true);
+});
+
+/* ---------- S2.2b: domain closure (round-12 directive). Two blockers
+ * closed: (1) the fact path no longer best-effort-interprets raw
+ * payloads — an accessor array or a throwing Proxy may make itself
+ * opaque, but it can never make the DENIAL FACT vanish (pre-fix, the
+ * sanitizer's own v.map() / destructuring ran attacker code INSIDE the
+ * accounting path and a throw there erased the audit trail of the
+ * refusal: exactly the problem S2.2a claimed to have killed).
+ * (2) the domain is JSON-safe in the precise sense: admitted values
+ * keep distinct representations under the provenance hash — sparse
+ * holes, -0, symbol keys, named array extras and the "__proto__" key
+ * are refused or normalized, never silently collapsed. ---------- */
+
+test("S2.2b fact integrity: an accessor-array or throwing-Proxy reason cannot make intent_fail vanish", () => {
+  const { rt, sys, intent } = contractHarness(["flight"]);
+  const evil = [];
+  Object.defineProperty(evil, 0, { enumerable: true, get() { throw new Error("boom"); } });
+  evil.length = 1;
+  // pre-fix (86dd49b): factValue's array branch ran `v.map(...)` — the
+  // accessor fired, the sanitizer threw INSIDE #fact, the transition had
+  // already landed, and the intent_fail fact never recorded: the private
+  // truth moved while the ledger stayed silent.
+  sys.fail(intent, evil);
+  const f = evs(rt, "intent_fail").at(-1);
+  assert.ok(f, "the fail fact must land no matter what the reason refuses to reveal");
+  assert.deepEqual(f.reason, { $untrusted: true }); // refused whole — not read, not partially described
+  assert.equal(intent.state, "failed");
+  const last = evs(rt, "intent_state").at(-1);
+  assert.equal(last.toState, "failed");
+  assert.equal(last.intent, intent.id); // fact and replay still agree
+  // A Proxy that throws from its inspection traps: touching it may fire
+  // (the honest same-realm limit), but the try/catch means it still
+  // cannot suppress the fact.
+  const a2 = sys.register("p2");
+  const i2 = sys.open(a2, { goal: { g: 1 } });
+  const boom = () => { throw new Error("boom"); };
+  sys.fail(i2, new Proxy({ note: "sneak" }, { getPrototypeOf: boom, getOwnPropertyDescriptor: boom }));
+  const f2 = evs(rt, "intent_fail").at(-1);
+  assert.deepEqual(f2.reason, { $untrusted: true });
+  assert.equal(i2.state, "failed");
+  assert.equal(rt.verifyJournal(), true);
+});
+
+test("S2.2b fact integrity: a claim whose xact getter throws cannot preempt completion_denied", async () => {
+  const { rt, sys, intent, slot } = contractHarness(["flight"]);
+  await sys.call(intent, slot, { job: 1 }, { for: ["flight"] });
+  const claim = {
+    get xact() { throw new Error("boom"); }, // pre-fix: `const { xact } = claim` fired this BEFORE any denial could be written
+    obligation: "flight",
+  };
+  assert.equal(await asyncCode(sys.complete(intent, [claim])), "E_NO_EVIDENCE"); // pre-fix: raw "boom", no code, no fact
+  const d = evs(rt, "completion_denied").at(-1);
+  assert.ok(d, "refusal accounting must not be vetoable by the refused object");
+  assert.equal(d.xact, null); // getter-owned field extracts as null — never read through the getter
+  assert.equal(d.obligation, "flight"); // data-descriptor field survives extraction
+  assert.deepEqual(d.claim, { $untrusted: true });
+  assert.ok(d.why.includes("no dispatch binding"));
+  assert.equal(intent.state, "active"); // the refusal changed nothing
+  assert.equal(rt.verifyJournal(), true);
+});
+
+test("S2.2b domain edges: holes/-0/symbols/extra array props/__proto__ are refused or normalized, never silently collapsed", () => {
+  const rt = new Runtime();
+  const sys = new AgentSystem(rt);
+  const a = sys.register("d5");
+  const isDomain = (e) => e.code === "E_DOMAIN";
+  const holey = new Array(1); // [ <1 empty> ] — stringifies as "[null]", same as [null]
+  assert.throws(() => sys.open(a, { goal: { arr: holey } }), isDomain);
+  assert.throws(() => sys.open(a, { goal: { arr: (() => { const x = [1]; x.length = 3; return x; })() } }), isDomain);
+  const dense = sys.open(a, { goal: { arr: [null] } }); // admitted — and now the ONLY spelling
+  assert.equal(dense.goal.arr.length, 1);
+  const sym = Symbol("hidden"); // invisible to Object.entries and to JSON — refused, not dropped
+  assert.throws(() => sys.open(a, { goal: { o: 1, [sym]: 2 } }), isDomain);
+  const extra = [1];
+  extra.note = "invisible to the array's JSON"; // named extra: [1]'s hash never carried it
+  assert.throws(() => sys.open(a, { goal: { arr: extra } }), isDomain);
+  const accArr = [1]; // an accessor element is an EXECUTION path — refused without reading
+  Object.defineProperty(accArr, 1, { enumerable: true, get() { throw new Error("getter-ran"); } });
+  assert.throws(() => sys.open(a, { goal: { arr: accArr } }), isDomain); // if the getter ran, this throws "getter-ran", not E_DOMAIN
+  // -0 and 0 share one JSON binding — the record normalizes instead of collapsing:
+  const neg = sys.open(a, { goal: { z: -0 } });
+  assert.equal(Object.is(neg.goal.z, 0), true);
+  assert.equal(Object.is(evs(rt, "intent_open").at(-1).goal.z, 0), true);
+  // "__proto__": as a JSON-PARSED own data property it is legitimate DATA —
+  // the clone must preserve it as data, not route it through the prototype setter.
+  const protoKey = JSON.parse('{"__proto__": {"polluted": 1}}');
+  assert.equal(Object.getPrototypeOf(protoKey), Object.prototype); // own data prop, per JSON.parse semantics
+  const pk = sys.open(a, { goal: protoKey });
+  assert.equal(Object.getPrototypeOf(pk.goal), Object.prototype);
+  assert.equal(pk.goal.polluted, undefined);
+  assert.equal(Object.prototype.polluted, undefined); // nothing in the realm was polluted
+  const d = Object.getOwnPropertyDescriptor(pk.goal, "__proto__");
+  assert.ok(d && d.value && d.value.polluted === 1, "__proto__ stayed an OWN DATA PROPERTY through the clone");
+  const fd = Object.getOwnPropertyDescriptor(evs(rt, "intent_open").at(-1).goal, "__proto__");
+  assert.ok(fd && fd.value.polluted === 1, "and through the fact rebuild");
+  assert.equal(rt.verifyJournal(), true);
+});
+
+test("S2.2b gate integrity: a hostile `for:` list denies by descriptor — no getter runs, no dispatch, no charge", async () => {
+  const { rt, sys, intent, slot, hits } = contractHarness(["flight"]);
+  const evil = ["flight"];
+  Object.defineProperty(evil, 1, { enumerable: true, get() { throw new Error("boom"); } });
+  // pre-fix: `for (const oid of obligationIds)` fired the getter mid-gate —
+  // raw "boom", no E_INVAL, no intent_call denied fact.
+  assert.equal(await asyncCode(sys.call(intent, slot, { job: 1 }, { for: evil })), "E_INVAL");
+  const c = evs(rt, "intent_call").at(-1);
+  assert.equal(c.outcome, "denied");
+  assert.equal(c.code, "E_INVAL");
+  assert.equal(hits(), 0); // the tool was never touched
+  assert.equal(intent.spent, 0); // and nothing was charged
+  assert.equal(intent.state, "active"); // grantFor had activated; the refused call changes no further truth
   assert.equal(rt.verifyJournal(), true);
 });

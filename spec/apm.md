@@ -1,6 +1,6 @@
 # APM — the Agamen Agent Process Model (normative, S2)
 
-> Status: **normative spec, rev. S2.0.8** — it stands on its own;
+> Status: **normative spec, rev. S2.0.9** — it stands on its own;
 > `src/intent.js` (S1) is its first, partial implementation. S2.0.1 closed
 > the spec-review gaps (§8 lists the six pins); S2.0.2 is the round-6
 > honesty patch: CO-5 is defined as a three-phase order (binding
@@ -26,7 +26,14 @@
 > (S2.2a): authoritative state speaks one JSON-safe plain-data domain,
 > facts are SANITIZED into fixed structures — never converted through
 > attacker-controlled code — and a ContextVersion handed out by the
-> view is a detached value, not a cursor.
+> view is a detached value, not a cursor; S2.0.9 is the round-12
+> domain closure (S2.2b): the domain is nailed to values that keep
+> DISTINCT representations under the provenance hash (dense arrays,
+> own enumerable string-keyed data props, -0 normalized, holes and
+> symbol keys refused), and the fact path admits two categories only —
+> APM-owned values copied in full, raw payloads inspected by descriptor
+> and branch-refused to a fixed `{$untrusted}` marker, so a hostile
+> value can choose its own opacity but can never veto a denial fact.
 > ST-4 remains explicitly NOT claimed.
 > This file inherits the
 > vocabulary of `spec/invariants.md` and the track definitions of
@@ -235,28 +242,66 @@ ST-3  Lifecycle state is private to the model layer; principals get
       getter, so even a hypothetical getter rewrite could not
       misattribute a fact. The public getters are presentation only.
       And the state LANGUAGE is a frozen JSON-safe plain-data domain
-      (S2.2a): allow null | boolean | finite number | string |
-      array<value> | plain object<string, value>; refuse undefined |
-      bigint | NaN | Infinity | function | symbol | Date | Map | Set |
-      typed arrays | class instances | cycles. The domain is defined
-      independently of any copier — "cloneable" is NOT "representable":
-      structuredClone happily accepts a Map and a BigInt, and under
-      JSON-shaped provenance hashing the Map serializes to `{}` (two
-      different beliefs, one hash binding) while the BigInt throws
-      inside `record()`. Out of domain, the two sanctioned responses
-      are refuse or sanitize, and NEVER a conversion the value itself
-      controls: no `String(v)`, no `toString`, no `Symbol.toPrimitive`,
-      no getter is ever executed while owning or sanitizing a value —
-      a hostile object's throwing conversion must not be able to
-      suppress the denial fact of its own refusal. Ingress refuses
-      (E_DOMAIN) before any write; the fact path rebuilds each value
-      structurally, replacing unrepresentable leaves with fixed
-      markers, so the fact always lands and its hash binds its
-      content. Authoritative records are built by a same-realm
+      (S2.2a, closed by S2.2b): "JSON-safe" is NOT "JSON.stringify
+      does not throw" — it is that distinct admitted values keep
+      distinct representations in the provenance hash. The admitted
+      domain, exactly:
+        scalar   null | boolean | finite number | string, where -0 is
+                 admitted and normalized to 0 on ingress (JSON
+                 collapses the two, so a ledger that stored both would
+                 bind two beliefs to one hash)
+        array    DENSE: own indices exactly 0..length-1, data elements
+                 only, no holes, no named extras, no symbol keys
+        object   own enumerable STRING-keyed DATA properties only, on
+                 a plain (or null) prototype — no accessors, no
+                 symbols, no non-enumerables
+        refused  undefined | bigint | NaN | Infinity | function |
+                 symbol | Date | Map | Set | typed arrays | class
+                 instances | cycles
+      The domain is defined independently of any copier — "cloneable"
+      is NOT "representable": structuredClone accepts a Map, and under
+      JSON-shaped hashing the Map serializes to `{}` while a sparse
+      `[hole]` and `[null]` serialize identically and a symbol-keyed
+      property simply disappears. Silent dropping is therefore not a
+      sanctioned response anywhere inside authoritative state: what
+      cannot be represented is REFUSED (E_DOMAIN) before any write,
+      and the copier never uses `map()` or plain property assignment,
+      both of which are execution paths (`map` reads elements, so an
+      accessor element fires; `out["__proto__"] = v` routes through the
+      prototype SETTER instead of creating a data property). Clones
+      build fresh objects through `defineProperty`, so a JSON-parsed
+      `"__proto__"` data property stays data.
+      The FACT path admits exactly two categories (S2.2b), because
+      recursively introspecting a hostile same-realm object safely is
+      not possible and an honest spec must not pretend otherwise:
+        owned    a value the system built itself (from domain-validated
+                 content) is copied in full, recursively — nothing an
+                 attacker controls is ever touched;
+        raw      anything else is inspected BY DESCRIPTOR ONLY — no
+                 element read, no iteration, no `String(v)`, no getter,
+                 no conversion — and the moment the inspection cannot
+                 certify the branch (accessor, symbol key, hole, named
+                 array extra, exotic prototype, or a trap that throws),
+                 the WHOLE branch is refused to the fixed marker
+                 `{$untrusted: true}`. Out-of-domain leaves at a scalar
+                 position become `{$notInDomain: <tag>}`.
+      Fact integrity outranks content preservation: a hostile payload
+      decides its own opacity, never the ledger's completeness. Fields
+      a refusal fact must carry (`xact`, `obligation`) are extracted
+      from own DATA DESCRIPTORS, so a `get xact() { throw }` cannot
+      preempt the denial of its own claim. The honest limit is stated
+      rather than papered over: touching a Proxy can fire its traps —
+      `getPrototypeOf` and `getOwnPropertyDescriptor` are not free in
+      this realm — so a hostile payload may EXECUTE while being
+      refused, but the accounting path wraps that inspection so it
+      still cannot SUPPRESS the fact. Closing this last blind spot is
+      Track E's job, not Track S's vocabulary. Ingress refuses
+      (E_DOMAIN) before any write; records are built by a same-realm
       structural copier, so exotic-realm artifacts never sit under the
       plain check either. In full, the boundary is: private state +
       branded ownership + no aliases out + no aliases in + immutable
-      behavior surface + one JSON-safe value domain.
+      behavior surface + one JSON-safe value domain whose admitted
+      values stay distinct under the hash.
       [pinned in S2.1a + S2.1b +
       S2.1c + S2.1d: `every determinable
       field is read-only from the token`, `relations and configuration
@@ -287,11 +332,24 @@ ST-3  Lifecycle state is private to the model layer; principals get
       no truth and no ledger` (refused opens journal no genesis fact;
       the ledger does not grow during refusals at all), `S2.2a
       sanitization: a hostile toString cannot suppress a denial fact`
-      (the refusal fact lands with fixed markers; pre-fix the
-      conversion threw and the audit trail vanished), `S2.2a
+      (the refusal lands with its xact/obligation extracted from data
+      descriptors and the accessor-bearing payload branch-refused
+      whole to `{$untrusted}`; pre-fix the conversion threw and the
+      audit trail vanished), `S2.2a
       sanitization: out-of-domain fact payloads become fixed markers`,
       `S2.2a context: current() hands out a DETACHED ContextVersion`
-      (v3 stays v3 while the head walks to v5)]
+      (v3 stays v3 while the head walks to v5), `S2.2b fact integrity:
+      an accessor-array or throwing-Proxy reason cannot make
+      intent_fail vanish` (pre-fix the sanitizer's own `v.map()` fired
+      the accessor INSIDE the accounting path — the transition landed
+      and the fact did not), `S2.2b fact integrity: a claim whose xact
+      getter throws cannot preempt completion_denied`, `S2.2b domain
+      edges: holes/-0/symbols/extra array props/__proto__ are refused
+      or normalized, never silently collapsed` (`[hole]` refused while
+      `[null]` admitted; a JSON-parsed `__proto__` stays an own data
+      property through clone AND fact; -0 records as 0), `S2.2b gate
+      integrity: a hostile `for:` list denies by descriptor — no
+      getter runs, no dispatch, no charge`]
 ST-4  Intent transition serial order: effect dispatch, handoff, revoke
       (including each cascade leg), approval consumption,
       amend/supersede, and every lifecycle edge on one intent are
@@ -703,6 +761,46 @@ trusted-state work — the COMPLETING machinery proper (ST-1 check
 state, four obligation kinds, matcher, DC-5) is the next slice;
 substrate untouched, no new DEP, ST-4 unclaimed.
 
+**S2.0.9 (round-12 domain closure, landed 2026-09-20 — code slice
+S2.2b)** — the review of 86dd49b SIGNED the detached ContextVersion and
+the working-set commit rule but REVISED the value language: two
+BLOCKERs showed S2.2a had named the right standard and then missed it
+in both directions. (1) The sanitizer was itself an execution path. Its
+array branch called `v.map(...)`, which READS elements — an accessor
+element fired attacker code inside `#fact`, so `sys.fail(intent,
+accessorArray)` completed the transition and then lost the
+`intent_fail` fact: precisely the vanishing-audit-trail bug the slice
+claimed to have killed. The same shape lived in `const { xact } =
+claim`, which a `get xact() { throw }` could preempt before
+`completion_denied` was written, and the absolute claim that "no
+attacker-controlled code ever executes on the fact path" was
+unsupportable anyway, since `getPrototypeOf`/`getOwnPropertyDescriptors`
+fire Proxy traps. (2) The domain was not closed under distinctness:
+sparse `[,null]`-family arrays, sparse vs dense, `-0` vs `0`,
+symbol-keyed properties, named extras hanging off an array and the
+`__proto__` key (which plain assignment routes through the prototype
+SETTER) all either collapsed to one JSON binding or were silently
+dropped. Landed, and deliberately NOT a universal safe sanitizer —
+recursively introspecting a hostile same-realm object safely is
+impossible, and the spec now says so instead of pretending: the fact
+path admits two categories (owned values copied in full with nothing
+attacker-controlled ever touched; raw payloads inspected by descriptor
+only and branch-refused whole to `{$untrusted: true}` the moment
+anything fails certification), refusal fields come from DATA
+DESCRIPTORS, and the inspection is wrapped so a throwing trap can make
+a payload opaque but never a fact absent. The domain is nailed to the
+scalar/dense-array/plain-object form above, `-0` normalizes on ingress,
+and clones use `defineProperty` and index assignment rather than
+`map()` or `out[k] =`. Four teeth pin it, including the reviewer's two:
+`S2.2b fact integrity: an accessor-array or throwing-Proxy reason
+cannot make intent_fail vanish` (against 86dd49b the getter fires
+inside `Array.map` exactly as predicted) and `S2.2b domain edges`
+(`[hole]` and `[null]` can no longer both be admitted). The value floor
+is now signed as stable, so COMPLETING machinery proper — ST-1 check
+state, the four obligation kinds, matcher semantics, DC-5 — is next
+with no further closure round in front of it. Substrate untouched, no
+new DEP, ST-4 unclaimed.
+
 **S2.1 (next code, in this order — reordered after round-5 review so no
 check ever runs against mutable truth)**
 
@@ -725,10 +823,13 @@ check ever runs against mutable truth)**
    check-state itself); plus the ROUND-9/10 PRE-WORKS, required because the `context` obligation reads them,
    in this fixed order (round-10: 先冻域，再造值，最后四种 obligation —
    do not reverse it):
-   (a) ~~first, the PLAIN-DATA SNAPSHOT DOMAIN~~ LANDED (S2.2a) — the
-       domain above; exotic values are refused at the APM door and
-       sanitized on the fact path, with no attacker-controlled
-       conversion ever executed;
+   (a) ~~first, the PLAIN-DATA SNAPSHOT DOMAIN~~ LANDED (S2.2a, closed
+       by S2.2b) — the domain above; exotic values are refused at the
+       APM door, and the fact path admits owned values (copied in
+       full) and raw payloads (descriptor-inspected, branch-refused to
+       `{$untrusted}`) — with the honest limit stated: a same-realm
+       Proxy may still EXECUTE traps while being refused, but it can
+       never suppress the fact recording its refusal;
    (b) ~~then immutable per-version ContextVersion VALUES~~ LANDED
        (S2.2a) — `context.current()` hands out a detached
        `{version, snapshot, lineageRef}` value; the completion evidence

@@ -58,7 +58,7 @@ provable against each other. The negative gate is the milestone:
 `complete()` refuses without at least one evidence item backed by a
 journaled `ok` invocation. Acceptance: 13 lifecycle + negative tests.
 
-## S2 — APM as normative spec (rev. S2.0.8, `spec/apm.md`)
+## S2 — APM as normative spec (rev. S2.0.9, `spec/apm.md`)
 
 The spec stands on its own, independent of the JavaScript prototype. It
 is built on three separations — **Ownership is not authority. Evidence
@@ -340,6 +340,51 @@ doesn't exist) and all 44 older pass unchanged. `runtime.js`
 untouched; no new DEP; ST-4 not claimed. Next slice: the COMPLETING
 machinery proper — ST-1 entry-as-check, four obligation kinds, matcher
 semantics — then DC-5 negative-gate-first.
+
+**S2.2b progress** (2026-09-20, domain closure, round-12 directive):
+round 12 SIGNED the detached ContextVersion and the working-set commit
+rule but REVISED the value language on two BLOCKERs, requiring a small
+domain-closure slice before COMPLETING proper. BLOCKER 1: the S2.2a
+sanitizer was itself an execution path — its array branch ran
+`v.map(...)`, which READS elements, so an accessor element threw
+inside `#fact` AFTER the transition had landed: `intent_fail` vanished
+and the private truth moved silently, exactly the failure mode the
+slice claimed to have eliminated; the same shape lived in
+`const { xact } = claim` (a `get xact() { throw }` preempted
+`completion_denied`), and the absolute "no attacker code ever executes"
+claim was unsupportable since Proxy traps fire on `getPrototypeOf` /
+`getOwnPropertyDescriptor`. The directive was explicit: do NOT keep
+chasing a universal safe sanitizer — recursively introspecting a
+hostile same-realm object safely is impossible. The fact path now
+admits two categories: APM-owned values (certified dense and data-only
+at build time via an `OWNED` WeakSet — a trust test no Proxy can trap)
+copied in full, and RAW payloads inspected by descriptor only and
+branch-refused whole to `{$untrusted: true}` the moment certification
+fails, inside a try/catch so a throwing trap can make a payload opaque
+but never make a denial fact absent; refusal fields (`xact`,
+`obligation`) are extracted from DATA DESCRIPTORS, and caller lists on
+gate paths (`for:`, claims) are read by index descriptor, never
+iterated. BLOCKER 2: the domain was not closed under distinctness —
+sparse holes vs `null`, `-0` vs `0`, symbol keys, named array extras
+and the `__proto__` key either collapsed to one JSON binding or were
+silently dropped. The domain is now exact: dense data arrays, own
+enumerable string-keyed data props on a plain/null prototype, `-0`
+normalized to 0 on ingress, holes and symbol keys REFUSED not dropped,
+and clones built by `defineProperty`/index assignment so a JSON-parsed
+`__proto__` stays an own data property (the round-12 principle, now in
+the spec verbatim: "JSON-safe" is not "stringify does not throw" —
+admitted values must keep their distinctness in the provenance
+representation). Five oracles (four new; the round-11 hostile-claim
+test re-asserted against the new refusal shape), 52/52 APM + 51/51
+invariant; against pre-fix `86dd49b` exactly those five fail (the
+accessor getter fires inside `Array.map` verbatim as the review
+predicted; the throwing `xact` getter yields raw "boom" and no denial
+fact; sparse arrays pass the old domain; the hostile `for:` list dies
+before `E_INVAL`) and all 47 older tests pass unchanged. `runtime.js`
+untouched; no new DEP; ST-4 not claimed. The value floor is signed
+stable — next slice, with no further closure round in front of it:
+COMPLETING machinery proper (ST-1 entry-as-check, four obligation
+kinds, matcher semantics), then DC-5 negative-gate-first.
 
 # Track E — enforcement
 

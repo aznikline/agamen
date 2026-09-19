@@ -29,14 +29,19 @@
  * (intent id, principal id) is record data: internal code resolves
  * ids through PRIV/AGENT_PRIV and never through a presentation getter,
  * so even a hypothetical getter rewrite could not misattribute a
- * single ledger fact. S2.2a gives COMPLETING its floor: authoritative
- * state speaks one JSON-safe plain-data domain (plain objects, arrays,
- * strings, booleans, finite numbers, null — no Map/Set/Date/class/
- * bigint/function/symbol/cycle can enter a record or a fact, because
- * provenance hashes by JSON shape), facts are SANITIZED into fixed
- * marker structures rather than converted with attacker-controlled
- * String()/getters (a hostile toString can no longer make a denial
- * fact vanish), and a ContextVersion handed out by `context.current()`
+ * single ledger fact. S2.2a gave COMPLETING its floor and S2.2b
+ * closed it: authoritative state speaks one JSON-safe plain-data
+ * domain — dense arrays, own enumerable string-keyed data props,
+ * -0 normalized, symbol keys and holes refused rather than silently
+ * dropped — where "JSON-safe" means DISTINCT VALUES KEEP DISTINCT
+ * REPRESENTATIONS under provenance's hashing, not "stringify does not
+ * throw". The fact path admits two categories only: APM-owned values,
+ * copied in full; and raw payloads, inspected by descriptor and
+ * branch-refused to a fixed {$untrusted} marker the moment anything
+ * non-plain is touched — no element reads, no getters, no
+ * String(v), so a hostile accessor array or a throwing-Proxy reason
+ * can make itself opaque but can never make a denial fact vanish.
+ * And a ContextVersion handed out by `context.current()`
  * is a truly detached value: read v3 and it stays v3 while the head
  * walks on to v5.
  *
@@ -150,23 +155,34 @@ function normalizeContract(list) {
  * is `mutateContext`/`mergeContext` — an AgentSystem act journalling
  * context_version {fromVersion, toVersion, cause}. */
 
-/* ---------- the JSON-safe plain-data domain (S2.2a, spec §8 item 2 pre-work a) ----------
- * Provenance hashes events by their JSON shape, so "structurally
- * cloneable" is NOT good enough for authoritative state: a Map and a
- * Set both clone fine and both serialize to {} — two different beliefs
- * with one hash binding; a cycle clones but throws inside record(),
- * after the seq number is consumed. The domain is therefore frozen
- * independently of structuredClone:
- *   allow: null | boolean | finite number | string | array<value> |
- *          plain object<string,value>
- *   refuse: undefined | bigint | NaN | Infinity | function | symbol |
- *           Date | Map | Set | typed arrays | class instances | cycles
- * The walk reads only own DATA descriptors (an accessor would execute
- * attacker code the moment it is inspected) and never touches
- * v.constructor / Symbol.toStringTag (attacker-controlled), so the
- * verdict — and the fixed message — comes from structure alone.
- * Cycles are refused by path membership, so shared (DAG) references
- * stay legal. */
+/* ---------- the JSON-safe plain-data domain (S2.2a, spec §8 item 2 pre-work a; closed by S2.2b) ----------
+ * "JSON-safe" is NOT "JSON.stringify does not throw" — it is that
+ * DISTINCT VALUES KEEP DISTINCT REPRESENTATIONS in the provenance
+ * hash. structuredClone is not the standard: a Map and a Set clone
+ * fine and both serialize to {}; a hole and a null serialize the same;
+ * a cycle throws inside record() after the seq number is consumed.
+ * The admitted domain, exactly:
+ *   scalar   null | boolean | finite number (-0 admitted, normalized
+ *            to 0 on the way in — JSON collapses them) | string
+ *   array    DENSE, indices exactly 0..length-1, data elements only,
+ *            no holes, no named extras, no symbol keys
+ *   object   own enumerable STRING-keyed DATA properties only,
+ *            plain (or null) prototype — no accessors, no symbols,
+ *            no non-enumerables
+ *   refused  undefined | bigint | NaN | Infinity | function | symbol |
+ *            Date | Map | Set | typed arrays | class instances | cycles
+ * The walk reads only own descriptors and never touches
+ * v.constructor / Symbol.toStringTag, so the verdict comes from
+ * structure alone. Cycles are refused by path membership, so shared
+ * (DAG) references stay legal. */
+
+/* Values the module itself built from domain-validated content: dense,
+ * data-only, accessor-free BY CONSTRUCTION. Facts may copy these
+ * recursively without ever introspecting (i.e. ever TOUCHING)
+ * something an attacker controls. Everything else that reaches a fact
+ * is a RAW payload and gets the non-executing treatment below. */
+const OWNED = new WeakSet();
+
 function checkDomain(v, seen, what) {
   if (v === null || typeof v === "string" || typeof v === "boolean") return;
   if (typeof v === "number") {
@@ -177,38 +193,65 @@ function checkDomain(v, seen, what) {
     throw new SubstrateError("E_DOMAIN", `${what}: '${typeof v}' has no JSON binding — undefined/bigint/function/symbol are refused at the door`);
   }
   if (seen.has(v)) throw new SubstrateError("E_DOMAIN", `${what}: cycles have no JSON binding`);
-  if (!Array.isArray(v)) {
-    const proto = Object.getPrototypeOf(v);
-    if (proto !== Object.prototype && proto !== null) {
-      throw new SubstrateError("E_DOMAIN", `${what}: plain objects and arrays only — Date/Map/Set/class instances have no stable JSON binding`);
-    }
+  const arr = Array.isArray(v);
+  const proto = Object.getPrototypeOf(v);
+  if (arr ? proto !== Array.prototype : proto !== Object.prototype && proto !== null) {
+    throw new SubstrateError("E_DOMAIN", `${what}: plain objects and arrays only — Date/Map/Set/class instances have no stable JSON binding`);
   }
+  if (Object.getOwnPropertySymbols(v).length > 0) {
+    throw new SubstrateError("E_DOMAIN", `${what}: symbol-keyed properties are invisible to the JSON hash — refused, not dropped`);
+  }
+  const descs = Object.entries(Object.getOwnPropertyDescriptors(v));
   seen.add(v);
-  for (const [key, prop] of Object.entries(Object.getOwnPropertyDescriptors(v))) {
-    if ("get" in prop || "set" in prop) {
-      throw new SubstrateError("E_DOMAIN", `${what}.${key}: accessor properties are refused — reading them executes attacker code`);
+  if (arr) {
+    const len = v.length;
+    let filled = 0;
+    for (const [key, prop] of descs) {
+      if (key === "length") continue; // the array's own slot counter, non-enumerable
+      const idx = Number(key);
+      if (!Number.isInteger(idx) || idx < 0 || idx >= len || "get" in prop || "set" in prop) {
+        throw new SubstrateError("E_DOMAIN", `${what}: arrays are dense data lists — no named extras, no accessor elements`);
+      }
+      filled += 1;
+      checkDomain(prop.value, seen, `${what}[${key}]`);
     }
-    checkDomain(prop.value, seen, `${what}.${key}`);
+    if (filled !== len) throw new SubstrateError("E_DOMAIN", `${what}: sparse arrays are refused — a hole and a null share one JSON representation`);
+  } else {
+    for (const [key, prop] of descs) {
+      if ("get" in prop || "set" in prop) {
+        throw new SubstrateError("E_DOMAIN", `${what}.${key}: accessor properties are refused — reading them executes attacker code`);
+      }
+      if (prop.enumerable !== true) {
+        throw new SubstrateError("E_DOMAIN", `${what}.${key}: non-enumerable properties are invisible to the JSON hash — refused, not dropped`);
+      }
+      checkDomain(prop.value, seen, `${what}.${key}`);
+    }
   }
   seen.delete(v);
 }
 
-/* The domain makes a hand-rolled copier possible and provably faithful:
- * after checkDomain, a value is ONLY null/boolean/string/finite-number/
- * array/plain-object with own data props and no cycles, so rebuilding
- * bottom-up IS the deep clone. structuredClone is deliberately NOT used
- * for authoritative ingress: its output carries the host realm's
- * prototypes, and a realm-mismatched object is exactly what the plain
- * check refuses — records built from structuredClone clones would fail
- * their own domain on re-entry. plainClone keeps every stored value in
- * THIS realm, structurally plain by construction. */
+/* The domain makes a hand-rolled copier possible and provably
+ * faithful — but ONLY with non-executing reads: index-position
+ * assignment on fresh arrays (never `map()`, which would fire an
+ * attacker's accessor element) and defineProperty on fresh objects
+ * (never `out[k] = …`, which routes "__proto__" through the prototype
+ * SETTER instead of creating a data property). structuredClone is not
+ * used for authoritative ingress: its output carries host-realm
+ * prototypes, which the plain check would refuse on re-entry. */
 function plainClone(v) {
-  if (v === null || typeof v !== "object") return v;
-  if (Array.isArray(v)) return v.map(plainClone);
+  if (v === null || typeof v !== "object") return Object.is(v, -0) ? 0 : v;
+  if (Array.isArray(v)) {
+    const len = v.length; // dense data arrays only, by precondition (checkDomain or OWNED)
+    const out = new Array(len);
+    for (let i = 0; i < len; i++) out[i] = plainClone(v[i]);
+    OWNED.add(out);
+    return out;
+  }
   const out = {};
   for (const [k, prop] of Object.entries(Object.getOwnPropertyDescriptors(v))) {
-    out[k] = plainClone(prop.value); // data props only — checkDomain already refused accessors
+    Object.defineProperty(out, k, { value: plainClone(prop.value), writable: true, enumerable: true, configurable: true });
   }
+  OWNED.add(out);
   return out;
 }
 
@@ -241,41 +284,111 @@ function snapshot(v) {
   return freezeDeep(plainClone(v));
 }
 
-/* INGRESS ownership (S2.1c, round-9 BLOCKER; sanitizer hardened by
- * S2.2a, round-11 MAJOR): the egress boundary says no mutable alias
- * LEAVES; this one says no caller-owned alias ENTERS authoritative state
- * or the ledger. Provenance does not clone events, so handing
- * rt.record() a caller reference keeps that reference inside an
- * already-hashed event — mutate through it afterwards and you have
- * rewritten the history verifyJournal() reads. Every fact value is
- * re-built bottom-up from its own descriptors (getters are never
- * invoked, `String(v)` is never called — an attacker's toString /
- * Symbol.toPrimitive may execute or throw, and a THROWING conversion
- * used to be able to erase the denial fact it was escaping). In-domain
- * content is kept as a structural copy; anything outside the domain
- * becomes a FIXED marker — the fact always lands, and it lands honest
- * about what could not be represented. Record-side ingress uses the
- * strict copier (cloneContext), never this lossy path. */
+/* INGRESS ownership (S2.1c, round-9 BLOCKER; sanitizer shape S2.2a,
+ * closed by round-12/BLOCKER-1): the fact path admits exactly two
+ * categories, and treats them differently.
+ *   APM-OWNED values (anything plainClone/factValue built) — dense,
+ *     data-only by construction — are copied in full, recursively,
+ *     with no introspection that an attacker could ever arrange to
+ *     mislead.
+ *   RAW payloads are never best-effort-interpreted: they pass a
+ *     DESCRIPTOR-ONLY inspection (no element reads, no `map()`, no
+ *     iteration, no `out[k] =`, no String(v), no getter, no
+ *     conversion — each of which was a live attacker-execution or
+ *     fact-erasure path in an earlier revision). Anything the
+ *     inspection cannot certify — accessor element, symbol key,
+ *     sparse hole, named array extra, exotic prototype, a trap that
+ *     THROWS — branch-refuses the whole value to the fixed marker
+ *     {$untrusted: true}. Fact integrity beats content preservation:
+ *     a hostile payload decides its own opacity, never the ledger's
+ *     completeness. The honest limit (same-realm JS): touching a
+ *     Proxy can fire its traps at all — getPrototypeOf/ownKeys are
+ *     not free — so a Proxy may EXECUTE while being refused, but the
+ *     try/catch means it still cannot SUPPRESS the fact.
+ * Record-side ingress uses the strict copier (cloneContext), never
+ * this path. */
 function factValue(v, seen = new WeakSet()) {
   if (v === null || typeof v === "string" || typeof v === "boolean") return v;
-  if (typeof v === "number") return Number.isFinite(v) ? v : { $notInDomain: "non-finite number" };
+  if (typeof v === "number") {
+    if (!Number.isFinite(v)) return { $notInDomain: "non-finite number" };
+    return Object.is(v, -0) ? 0 : v; // JSON collapses -0 and 0 — so does the record, explicitly
+  }
   if (typeof v !== "object") return { $notInDomain: typeof v }; // undefined | bigint | function | symbol
-  if (seen.has(v)) return { $notInDomain: "cycle" };
-  if (!Array.isArray(v)) {
+  if (OWNED.has(v)) return plainClone(v); // certified at build time — no inspection needed, nothing to execute
+  try {
+    if (seen.has(v)) return { $notInDomain: "cycle" };
+    const arr = Array.isArray(v);
     const proto = Object.getPrototypeOf(v);
-    if (proto !== Object.prototype && proto !== null) return { $notInDomain: "non-plain" }; // Date/Map/Set/class/typed array — no conversion is attempted
+    if (arr ? proto !== Array.prototype : proto !== Object.prototype && proto !== null) {
+      return { $notInDomain: "non-plain" }; // Date/Map/Set/class/typed array — no conversion is attempted
+    }
+    if (Object.getOwnPropertySymbols(v).length > 0) return { $untrusted: true };
+    const descs = Object.entries(Object.getOwnPropertyDescriptors(v));
     seen.add(v);
-    const out = {};
-    for (const [key, prop] of Object.entries(Object.getOwnPropertyDescriptors(v))) {
-      out[key] = "get" in prop || "set" in prop ? { $notInDomain: "accessor" } : factValue(prop.value, seen);
+    let out;
+    if (arr) {
+      const len = v.length;
+      out = new Array(len);
+      let filled = 0;
+      for (const [key, prop] of descs) {
+        if (key === "length") continue;
+        const idx = Number(key);
+        if (!Number.isInteger(idx) || idx < 0 || idx >= len || "get" in prop || "set" in prop) {
+          seen.delete(v);
+          return { $untrusted: true }; // accessor element or named extra — not read, refused
+        }
+        out[idx] = factValue(prop.value, seen);
+        filled += 1;
+      }
+      if (filled !== len) {
+        seen.delete(v);
+        return { $untrusted: true }; // a hole — [ , ] and [null] share one JSON representation
+      }
+    } else {
+      out = {};
+      for (const [key, prop] of descs) {
+        if ("get" in prop || "set" in prop || prop.enumerable !== true) {
+          seen.delete(v);
+          return { $untrusted: true }; // accessor or hash-invisible — the branch says no, it does not say partial
+        }
+        Object.defineProperty(out, key, { value: factValue(prop.value, seen), writable: true, enumerable: true, configurable: true });
+      }
     }
     seen.delete(v);
+    OWNED.add(out);
     return out;
+  } catch {
+    return { $untrusted: true }; // a hostile trap threw — the fact still lands, the payload stays opaque
   }
-  seen.add(v);
-  const out = v.map((x) => factValue(x, seen));
-  seen.delete(v);
-  return out;
+}
+
+/* Safe field extraction for RAW payloads on a refusal path: read the
+ * OWN DATA DESCRIPTOR, never `obj.x` — a `get xact() { throw … }` on
+ * a claim used to interrupt the check BEFORE completion_denied could
+ * be written. Accessor or absent reads as undefined; a throwing trap
+ * reads as undefined. The refusal is then built from what could not
+ * refuse us. */
+function safeDataField(obj, name) {
+  try {
+    const d = Object.getOwnPropertyDescriptor(obj, name);
+    return d && !("get" in d) && !("set" in d) ? d.value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/* The index-safe list reader for caller-supplied lists on gate and
+ * refusal paths: `for (const x of arr)` and `arr.map(...)` both read
+ * ELEMENTS (attacker accessors run), so every gate input is walked by
+ * descriptor instead. Non-index or accessor-owning lists read as
+ * short/invalid — the caller gets a denial, not a platform exception. */
+function dataAt(arr, i) {
+  try {
+    const d = Object.getOwnPropertyDescriptor(arr, String(i));
+    return d && !("get" in d) && !("set" in d) ? d.value : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 class ContextHead {
@@ -758,10 +871,16 @@ export class AgentSystem {
     }
     if (!Array.isArray(obligationIds)) denied("E_INVAL", "obligation bindings must be a list of ids");
     const byId = new Map(rec.contract.map((o) => [o.id, o]));
-    for (const oid of obligationIds) {
-      if (!byId.has(oid)) {
-        denied("E_INVAL", `dispatch binds no obligation: '${oid}' is not in ${rec.id}'s contract at revision ${rec.contractRevision}`);
+    // S2.2b: the list is read BY DESCRIPTOR, never iterated — a hostile
+    // `for:` array with an accessor element used to execute the getter
+    // (or throw) before any denial could be written.
+    const boundIds = [];
+    for (let i = 0; i < obligationIds.length; i++) {
+      const oid = dataAt(obligationIds, i);
+      if (typeof oid !== "string" || !byId.has(oid)) {
+        denied("E_INVAL", `dispatch binds no obligation: '${typeof oid === "string" ? oid : "«non-string element»"}' is not in ${rec.id}'s contract at revision ${rec.contractRevision}`);
       }
+      boundIds.push(oid);
     }
     this.#activate(intent, rec, "call"); // admitted: the attempt may now be charged
     rec.spent += 1; // charged-attempt, mirroring membrane semantics
@@ -780,7 +899,7 @@ export class AgentSystem {
           this.#fact({
             t: "intent_dispatch", intent: rec.id, slot, xact: x,
             ownerEpoch: rec.ownerEpoch, contractRevision: rec.contractRevision,
-            obligationIds: [...new Set(obligationIds)],
+            obligationIds: [...new Set(boundIds)],
           });
         },
       });
@@ -855,14 +974,19 @@ export class AgentSystem {
     // Working-set commit rule (§8 item 2, applied early to this path):
     // every claim is validated and owned BEFORE the evidence set moves,
     // so a refused completion leaves state AND ledger structurally
-    // valid — not even a candidate item survives the throw.
-    const prepared = claims.map((item) => {
-      const isBacked = !!(item && item.xact && backed.has(item.xact));
-      if (item && item.xact && !isBacked) {
-        throw new SubstrateError("E_NO_EVIDENCE", `evidence xact '${item.xact}' is not a journaled ok call on this intent`);
+    // valid — not even a candidate item survives the throw. Elements
+    // are read by descriptor (S2.2b): neither `map` nor `item.xact`
+    // ever touches an attacker-controlled getter.
+    const prepared = [];
+    for (let i = 0; i < claims.length; i++) {
+      const item = dataAt(claims, i);
+      const xact = item !== null && typeof item === "object" ? safeDataField(item, "xact") : undefined;
+      const isBacked = typeof xact === "string" && backed.has(xact);
+      if (xact !== undefined && xact !== null && !isBacked) {
+        throw new SubstrateError("E_NO_EVIDENCE", `evidence xact '${typeof xact === "string" ? xact : "«non-string»"}' is not a journaled ok call on this intent`);
       }
-      return { ...cloneContext(item ?? {}, "evidence item"), backed: isBacked };
-    });
+      prepared.push({ ...cloneContext(item ?? {}, "evidence item"), backed: isBacked });
+    }
     if (!prepared.some((e) => e.backed)) {
       throw new SubstrateError("E_NO_EVIDENCE", "no evidence item is backed by the ledger");
     }
@@ -879,21 +1003,38 @@ export class AgentSystem {
     const backed = this.#journalBackedXacts(rec.id);
     const bindings = this.#dispatchBindings(rec.id);
     const discharged = new Map(rec.contract.map((o) => [o.id, new Set()]));
-    const refuse = (claim, why) => {
-      this.#fact({ t: "completion_denied", intent: rec.id, claim: claim ?? null, why });
-      throw new SubstrateError("E_NO_EVIDENCE", why);
-    };
-    for (const claim of claims) {
-      const { xact, obligation } = claim ?? {};
-      const bind = xact ? bindings.get(xact) : null;
-      if (!bind) refuse(claim, `claim xact '${xact ?? "—"}' has no dispatch binding on ${rec.id}`);
-      if (!backed.has(xact)) refuse(claim, `dispatch '${xact}' did not settle ok — a failed call discharges nothing`);
+    const show = (s) => (typeof s === "string" ? s : "«non-string»"); // messages never String() a raw value either
+    const owned = [];
+    for (let i = 0; i < claims.length; i++) {
+      // S2.2b, round-12 BLOCKER 1: the claim is never DESTRUCTURED —
+      // `const { xact } = claim` fires `get xact() { throw }` before
+      // completion_denied can be written. Fields come from data
+      // descriptors; the payload itself is only ever recorded
+      // sanitized. The refusal carries what it needs even when the
+      // claim refuses to be introspected.
+      const claim = dataAt(claims, i);
+      owned.push(claim);
+      const isObj = claim !== null && typeof claim === "object";
+      const xact = isObj ? safeDataField(claim, "xact") : undefined;
+      const obligation = isObj ? safeDataField(claim, "obligation") : undefined;
+      const refuse = (why) => {
+        this.#fact({
+          t: "completion_denied", intent: rec.id,
+          xact: typeof xact === "string" ? xact : null,
+          obligation: typeof obligation === "string" ? obligation : null,
+          claim: claim ?? null, why,
+        });
+        throw new SubstrateError("E_NO_EVIDENCE", why);
+      };
+      const bind = typeof xact === "string" && xact !== "" ? bindings.get(xact) : null;
+      if (!bind) refuse(`claim xact '${xact === undefined ? "—" : show(xact)}' has no dispatch binding on ${rec.id}`);
+      if (!backed.has(xact)) refuse(`dispatch '${show(xact)}' did not settle ok — a failed call discharges nothing`);
       if (!bind.obligationIds.includes(obligation)) {
-        refuse(claim, `CO-5: '${xact}' was bound at dispatch to [${bind.obligationIds.join(", ") || "anonymous"}], not '${obligation}' — bindings precede effects`);
+        refuse(`CO-5: '${show(xact)}' was bound at dispatch to [${bind.obligationIds.join(", ") || "anonymous"}], not '${show(obligation)}' — bindings precede effects`);
       }
       const ob = rec.contract.find((o) => o.id === obligation);
       if (ob.bornEpoch > bind.ownerEpoch || ob.bornRevision > bind.contractRevision) {
-        refuse(claim, `HO-4: obligation '${obligation}' was born at (epoch ${ob.bornEpoch}, rev ${ob.bornRevision}) — after the dispatch's (epoch ${bind.ownerEpoch}, rev ${bind.contractRevision}); past work cannot pay for future promises`);
+        refuse(`HO-4: obligation '${show(obligation)}' was born at (epoch ${ob.bornEpoch}, rev ${ob.bornRevision}) — after the dispatch's (epoch ${bind.ownerEpoch}, rev ${bind.contractRevision}); past work cannot pay for future promises`);
       }
       discharged.get(obligation).add(xact);
     }
@@ -904,7 +1045,7 @@ export class AgentSystem {
       this.#fact({ t: "completion_denied", intent: rec.id, unmet });
       throw new SubstrateError("E_NO_EVIDENCE", `unmet obligations: ${unmet.join(", ")}`);
     }
-    rec.evidence.push(...claims.map((c) => ({ ...cloneContext(c ?? {}, "claim"), backed: true })));
+    rec.evidence.push(...owned.map((c) => ({ ...cloneContext(c ?? {}, "claim"), backed: true })));
     this.#transition(intent, "completed", "complete");
     this.#fact({
       t: "intent_complete", intent: rec.id, agent: AGENT_PRIV.get(rec.agent).id,
