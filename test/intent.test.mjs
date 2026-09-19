@@ -286,6 +286,34 @@ test("HO-4 across handoff: old-epoch receipts pay only for old-epoch promises", 
   assert.equal(intent.state, "completed");
 });
 
+test("CO-5 temporal: the binding is in the ledger WHILE the handler runs — effects cannot begin unbound", async () => {
+  const rt = new Runtime();
+  const sys = new AgentSystem(rt);
+  let seen = null;
+  const { server } = rt.serve("svc", "t", () => {
+    // synchronous effect: this body runs INSIDE request(), after the admit
+    // hook — anything less than "my own binding is already in the ledger"
+    // means the binding followed the effect
+    seen = evs(rt, "intent_dispatch").map((d) => `${d.obligationIds.join(",")}@${d.xact}`);
+    return 1;
+  });
+  const a = sys.register("p");
+  const intent = sys.open(a, { goal: { outcome: "g" }, contract: ["flight"] });
+  const slot = sys.grantFor(intent, server, "t");
+  const { xact } = await sys.call(intent, slot, {}, { for: ["flight"] });
+  assert.deepEqual(seen, [`flight@${xact}`]); // the effect witnessed its own binding
+});
+
+test("matcher fields are refused at the door, never silently ignored", () => {
+  const rt = new Runtime();
+  const sys = new AgentSystem(rt);
+  const a = sys.register("x");
+  assert.throws(
+    () => sys.open(a, { goal: { outcome: "g" }, contract: [{ id: "f", matcher: { tool: "bookFlight" } }] }),
+    (e) => e.code === "E_INVAL" && /matcher/.test(e.message)
+  );
+});
+
 /* ---------- suspend / resume on another model ---------- */
 
 test("suspend freezes effect; resume can rebind the model under a surviving principal", async () => {

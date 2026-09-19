@@ -93,16 +93,22 @@ policies over split parentage + supersede/waiver; epoch/revision
 stamping; AttentionRequest. All inside `src/intent.js`. No runtime
 features ride along.
 
-**S2.1 progress** (2026-09-19): dispatch-time obligation binding
-landed (spec §8 item 4, started out of order at the owner's request):
-`receipt` obligations declared at open/fork/delegate, appended only
-via `amend` (bumps `contractRevision`; supersede/waiver still
-planned); every dispatch journals
-`{intent, ownerEpoch, contractRevision, obligationIds, xact}`;
-`complete()` claims only SELECT bindings; `handoff` bumps
-`ownerEpoch`. 20/20 APM tests (7 new, all negative-first). Still
-open: items 1–3 (ST-3 privatization, ST-2 replay events, DC-5 closure
-gate), approval/closure/context obligation kinds, join policies.
+**S2.1 progress** (2026-09-19, round-5 hardened): dispatch-time
+obligation binding landed (spec §8 item 4, early by owner's request).
+The binding is journalled in the substrate's new host-plane **admit
+hook** (`request(…, { onAdmit })` — after the xact exists, before the
+handler runs; a throwing hook vetoes before any effect and settles as
+a fact), pinned by a temporal test in which the effect itself reads
+its binding out of the ledger. `receipt` obligations at
+open/fork/delegate, append-only `amend` (bumps `contractRevision`);
+non-null `matcher` REFUSED until matcher semantics land; `handoff`
+bumps `ownerEpoch`; `complete()` claims only SELECT. 22/22 APM +
+51/51 invariant tests. Honest labels: CO-1 is **[partial]** — the
+contract array is still publicly mutable; ST-3 (widened to
+state/contract/revisions/epoch/envelope/evidence/spent) is what turns
+"append-only" from convention into property. Next, in spec order:
+ST-3 → ST-2 → the COMPLETING skeleton (ST-1 + four kinds + matcher) →
+DC-5 — no check runs against mutable truth, no fourth oracle.
 
 # Track E — enforcement
 

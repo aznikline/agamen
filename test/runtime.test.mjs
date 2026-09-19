@@ -757,3 +757,38 @@ test("recv is self-service via the control handle; full round trip with attenuat
   assert.equal(m.msg.job, 42);
   assert.equal(m.sender, agent.id);
 });
+
+/* ---------- host-plane admit hook (required by APM CO-5) ---------- */
+
+test("onAdmit runs with the final xact BEFORE the handler — a binding fact can precede effects", async () => {
+  let seenByHandler = -1;
+  const { rt, client } = setup(async () => {
+    // this body IS the effect; the ledger as seen here was written before it
+    seenByHandler = rt.journalEntries().map((e) => e.event.t).filter((t) => t === "admit_mark").length;
+    return 1;
+  });
+  const req = rt.request(client, "t", {}, { onAdmit: (x) => rt.record({ t: "admit_mark", xact: x }) });
+  const result = await req.promise;
+  assert.equal(result, 1);
+  assert.equal(seenByHandler, 1); // the effect observed its own binding
+  assert.equal(evs(rt, "admit_mark")[0].xact, req.xact);
+  const names = rt.journalEntries().map((e) => e.event.t);
+  assert.ok(names.indexOf("admit_mark") < names.indexOf("invoke")); // admit-marked, then settled
+});
+
+test("a throwing onAdmit vetoes the dispatch before any effect; the veto is a fact, not silence", async () => {
+  let hits = 0;
+  const { rt, client } = setup(async () => { hits += 1; return 1; });
+  let threw = null;
+  try {
+    rt.request(client, "t", {}, { onAdmit: () => { throw new Error("veto"); } });
+  } catch (e) {
+    threw = e;
+  }
+  assert.equal(threw?.message, "veto"); // re-thrown to the caller, who never holds the promise
+  assert.equal(hits, 0);
+  await turn();
+  assert.equal(hits, 0); // and the handler stays uncalled
+  assert.equal(evs(rt, "invoke").at(-1)?.outcome, "fail"); // settled as a fact at veto time
+  assert.equal(evs(rt, "invoke_denied").length, 0); // admitted-then-vetoed ≠ denied
+});

@@ -69,9 +69,14 @@ function normalizeContract(list) {
     }
     const min = ob.minOccurrences ?? 1;
     if (!Number.isInteger(min) || min < 1) throw new SubstrateError("E_INVAL", "minOccurrences must be a positive integer");
+    if (ob.matcher !== null && ob.matcher !== undefined) {
+      // A field that looks like policy but executes nothing is a poisoned
+      // oracle waiting to happen: refuse it at the door.
+      throw new SubstrateError("E_INVAL", `matcher on obligation '${id}' is refused — matcher semantics land with the COMPLETING skeleton (spec §8); nothing is silently ignored`);
+    }
     if (seen.has(id)) throw new SubstrateError("E_INVAL", `duplicate obligation id '${id}'`);
     seen.add(id);
-    out.push({ id, kind: "receipt", matcher: ob.matcher ?? null, minOccurrences: min });
+    out.push({ id, kind: "receipt", minOccurrences: min });
   }
   return out;
 }
@@ -383,17 +388,22 @@ export class AgentSystem {
     try {
       // request() denies synchronously (deadline/cap/clone); it must still
       // land inside the try or the refusal would leave no intent-level fact.
+      // The binding fact is written in the substrate's ADMIT HOOK — after
+      // the xact exists, before the handler runs. The effect therefore
+      // cannot begin, let alone be observed, until the ledger already
+      // names the obligations it was dispatched for (CO-5, binding
+      // precedes effect literally, not just "precedes the await").
       const req = this.rt.request(intent.agent.control, slot, args, {
         correlationId: intent.id,
         deadline: intent.deadline,
-      });
-      xact = req.xact;
-      // The binding fact is written BEFORE any result is observable —
-      // completion claims can only select what this line recorded.
-      this.#fact({
-        t: "intent_dispatch", intent: intent.id, slot, xact,
-        ownerEpoch: intent.ownerEpoch, contractRevision: intent.contractRevision,
-        obligationIds: [...new Set(obligationIds)],
+        onAdmit: (x) => {
+          xact = x;
+          this.#fact({
+            t: "intent_dispatch", intent: intent.id, slot, xact: x,
+            ownerEpoch: intent.ownerEpoch, contractRevision: intent.contractRevision,
+            obligationIds: [...new Set(obligationIds)],
+          });
+        },
       });
       const result = await req.promise;
       this.#fact({ t: "intent_call", intent: intent.id, slot, xact, outcome: "ok" });

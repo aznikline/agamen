@@ -135,9 +135,15 @@ ST-2  Every state edge is a journaled fact in one normalized shape:
       derived from facts, not mutable truth*. [planned: S1 events carry
       no from/to/version yet]
 ST-3  Lifecycle state is private to the model layer; principals get
-      read-only views. (S1 debt: fields are public — the strong
-      reading of OT's second line requires this before it may be
-      claimed. [planned])
+      read-only views. The private set is at minimum:
+        state, contract, contractRevision, ownerEpoch, envelope,
+        evidence, spent
+      — anything less lets a caller mutate the very things the checks
+      read (a `contract.pop()` erases an obligation with no fact), and
+      "frozen/append-only" remains an API convention, not a property.
+      (S1 debt: fields are public — the strong reading of OT's second
+      line requires this before it may be claimed. [planned, widened
+      in round-5 review; gates CO-1's [pinned]])
 ST-4  Intent transition serial order: effect dispatch, handoff, revoke
       (including each cascade leg), approval consumption,
       amend/supersede, and every lifecycle edge on one intent are
@@ -172,14 +178,21 @@ CO-1  Every intent carries a CompletionContract, frozen at creation
       the contract names (default: an approval obligation — erasing a
       requirement is a decision someone must own). Amend/supersede
       bumps `contractRevision` and reopens COMPLETING checks for
-      previously satisfied obligations. [append-only amend + revision
-      bump pinned in S2.1: `append-only amend — work done before an
-      obligation is born can never pay for it`; supersede/waiver
-      planned (§8 item 5)]
+      previously satisfied obligations. [partial: the append-only amend
+      act and revision bump are pinned in S2.1 (`append-only amend —
+      work done before an obligation is born can never pay for it`),
+      but the obligation ARRAY is still publicly mutable — pop/push/
+      field-writes can bypass amend and its fact. "Frozen" is a lie
+      until ST-3 privatizes these fields. supersede/waiver planned
+      (§8 item 5)]
 CO-2  The contract is a finite set of obligations, each:
         { id, kind, matcher, minOccurrences, bornRevision }
       where `bornRevision` is the contractRevision at which the
-      obligation entered the contract. Machine-checkable kinds only:
+      obligation entered the contract. A non-null `matcher` is
+      REFUSED at construction until matcher semantics land (S2.1) —
+      a policy field that silently evaluates to nothing is a poisoned
+      oracle in waiting; refusing is the honest default.
+      Machine-checkable kinds only:
         receipt   — ≥ minOccurrences ledger-backed ok calls whose
                     dispatch binding names this obligation id (CO-5)
         approval  — ≥ minOccurrences grant facts for this intent ∩
@@ -200,19 +213,25 @@ CO-4  The contract is the boundary of the promise: Agamen guarantees
       guarantees NOTHING about whether the discharge means the world
       is in the desired state. That is the exact content of
       *evidence is not correctness*.
-CO-5  Obligation binding precedes the effect. The dispatch fact of an
-      effect-bearing call carries
+CO-5  Obligation binding precedes the effect — literally. The binding
+      is journalled AFTER the xact exists and BEFORE the handler
+      executes (the substrate's host-plane admit hook is the one sound
+      place; "written after request() returns" is NOT dispatch-time —
+      a synchronous effect would already have happened). The dispatch
+      fact of an effect-bearing call carries
         { intent, ownerEpoch, contractRevision, obligationIds, xact }
-      — the obligations the call was made FOR, chosen before anything
-      it does can be observed. Completion may only consume bindings the
-      ledger recorded at dispatch; re-labelling an anonymous past call
-      at completion time is structurally impossible, because no
-      completion-time act can write a dispatch-time fact. Without this
-      rule the contract has no teeth: any successful call could be
-      renamed into any receipt later. [pinned in S2.1: `a success bound
-      to A can never be re-labelled into obligation B`, `an anonymous
-      success cannot be renamed into a receipt at completion`, `binding
-      an unknown obligation is refused BEFORE the effect dispatches`]
+      — the obligations the call was made FOR, in the ledger before
+      anything it does can begin, let alone be observed. Completion may
+      only consume bindings the ledger recorded at dispatch;
+      re-labelling an anonymous past call at completion time is
+      structurally impossible, because no completion-time act can write
+      a dispatch-time fact. Without this rule the contract has no
+      teeth: any successful call could be renamed into any receipt
+      later. [pinned in S2.1: `the binding is in the ledger WHILE the
+      handler runs`, `a success bound to A can never be re-labelled
+      into obligation B`, `an anonymous success cannot be renamed into
+      a receipt at completion`, `binding an unknown obligation is
+      refused BEFORE the effect dispatches`]
 ```
 
 `goal: "book trip"` with obligations
@@ -373,15 +392,19 @@ parentage/join-policy (DC-4) with race losers `CANCELLED(reason)`
 (DC-3); normalized replay events `from/to/stateVersion/cause` (ST-2);
 and the demoted, honest Linux-library test (§7).
 
-**S2.1 (next code, in this order)**
+**S2.1 (next code, in this order — reordered after round-5 review so no
+check ever runs against mutable truth)**
 
-1. lifecycle privatization (ST-3) + normalized, replay-unique events
-   (ST-2);
-2. `CompletionContract` at open/fork with `bornRevision`, the four
-   obligation kinds, and COMPLETING as a check (CO-1…4, ST-1);
+1. lifecycle privatization (ST-3, widened: state, contract,
+   contractRevision, ownerEpoch, envelope, evidence, spent) +
+   normalized, replay-unique events (ST-2);
+2. the COMPLETING skeleton complete: ST-1 entry-as-check, all four
+   obligation kinds, matcher semantics (CO-1…4) — CO-1 may only be
+   marked [pinned] when item 1 makes "frozen" a property, not a
+   convention;
 3. closure negative gate first, as a test before the feature (DC-5);
-4. dispatch-time binding: `(epoch, revision, obligationIds)` on every
-   effect dispatch + selection-only claims (CO-5, ST-4);
+4. ~~dispatch-time binding~~ LANDED (CO-5 pinned by the temporal test;
+   written in the substrate's admit hook, refusing matcher included);
 5. join policies required/optional/race/detached over the split
    parentage relation (DC-1…4), supersede/waiver for DC-1's escape;
 6. epoch/revision stamping + late-receipt admission (HO-2…5);

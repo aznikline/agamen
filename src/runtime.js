@@ -444,7 +444,16 @@ export class Runtime {
    * `control` is ALWAYS an ActorControl handle: an actor's slot table may
    * only be driven by whoever holds its controller. */
 
-  request(control, slot, args, { deadline = null, signal = null, correlationId = null } = {}) {
+  /* Mediated invocation. `control` is ALWAYS an ActorControl handle: an
+   * actor's slot table may only be driven by whoever holds its
+   * controller. `onAdmit(xact)` — host-plane only — runs synchronously
+   * after the request is registered (its xact exists and is final) and
+   * BEFORE the handler executes: the one sound place for a dispatch-time
+   * binding fact, since nothing the effect does can be observed until
+   * the ledger already carries it. A throwing onAdmit aborts the
+   * dispatch before any effect: the invoke settles as fail and the
+   * error is re-thrown to the caller (who never receives the promise). */
+  request(control, slot, args, { deadline = null, signal = null, correlationId = null, onAdmit = null } = {}) {
     const x = this.#x("x");
     const corr = correlationId !== null ? { correlationId } : {};
     const deny = (code, msg) => {
@@ -530,6 +539,14 @@ export class Runtime {
     };
 
     let h;
+    if (onAdmit) {
+      try {
+        onAdmit(x);
+      } catch (err) {
+        r.settle("fail"); // admitted, then refused: a fact, not silence
+        throw err;
+      }
+    }
     try {
       h = rec.target.handler(margs, frozenCtx);
     } catch (err) {
