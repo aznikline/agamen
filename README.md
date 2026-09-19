@@ -11,7 +11,7 @@ backend decision ([ROADMAP](ROADMAP.md) M5).
 
 > Status: **M0** — v0 in-memory substrate, ~200 lines, Node ≥ 20, dependency-free.
 > [Why "Agamen"?](docs/name.md) · [Design thesis](docs/thesis.md) ·
-> [Invariants (normative)](spec/invariants.md) · [Roadmap](ROADMAP.md)
+> [Invariants (normative)](spec/invariants.md) · [Evaluation charter](docs/evaluation.md) · [Roadmap](ROADMAP.md)
 
 ## The four primitives
 
@@ -55,6 +55,7 @@ spec/invariants.md                 normative invariants + threat model + accepta
 kernel/uapi/                       reference ABI seed (capability rights algebra)
 docs/name.md                       the Agamemnon case
 docs/thesis.md                     the form, and the backend question
+docs/evaluation.md                 measurement charter (quantitative method)
 ROADMAP.md                         M0–M5
 ```
 

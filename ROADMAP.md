@@ -3,7 +3,8 @@
 Form-first: semantics are proven in this userspace substrate before any of
 them earns kernel-ABI cost. Enforcement backends are a late, reversible
 decision (M5). Each milestone is gated by the acceptance table in
-`spec/invariants.md`.
+`spec/invariants.md`, and every cost claim follows the measurement rules in
+`docs/evaluation.md`.
 
 ## M0 — v0 invariant core (done, 2026-09-19)
 
@@ -16,7 +17,8 @@ Deadline, budget, and cancellation become first-class on the actor/mailbox
 path (not an advisory convention): a request whose deadline passed must not
 execute server-side; a saturated endpoint must shed or block explicitly, and
 must be cancellable via xact id. Carries over agate's EDF-experiment result
-(P0-1) from paper to practice. Acceptance: deadline/cancel + lifecycle rows.
+(P0-1) from paper to practice. Acceptance: deadline/cancel + lifecycle rows, and `bench/baseline.md` with
+the per-invoke cost model fitted (see `docs/evaluation.md`).
 
 ## M2 — approval leases
 
