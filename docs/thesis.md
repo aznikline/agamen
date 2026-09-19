@@ -39,8 +39,9 @@ provably part of the authority decision.
 
 ## 3. Relationship to Agate
 
-Agate (capability microkernel, same author) enforces a kernel subset of these
-invariants with page tables and EL0 traps. The mapping is 1:1 on purpose:
+Agate (capability microkernel, same author) is the **ancestor and prior
+art**: it enforces a kernel subset of these invariants with page tables and
+EL0 traps. The mapping is 1:1 on purpose:
 
 | Substrate (here)          | Agate (kernel)                       |
 |---------------------------|--------------------------------------|
@@ -51,12 +52,17 @@ invariants with page tables and EL0 traps. The mapping is 1:1 on purpose:
 | `Membrane`                | endpoint caps; approval lease (P4)   |
 | `Provenance`              | audit chokepoint (spec 13 §13)       |
 
-This repo is the fast feedback loop: semantics can be argued, broken, and
-measured in 200 lines of JavaScript before they cost a kernel ABI change.
+Agamen is form-first: semantics are argued, broken, and measured in 200 lines
+of JavaScript before any of them costs a kernel ABI. The mapping above is a
+migration contract, not a submission queue — agate is one *candidate
+enforcement backend* for these semantics (ROADMAP M5), alongside a hardened
+userspace runtime or, eventually, Agamen's own kernel.
 
-## 4. Graduation criteria (when something moves to the kernel)
+## 4. Enforcement criteria (when a primitive moves below the substrate)
 
-A primitive graduates only when all of the following hold:
+A primitive becomes an *enforcement backend's obligation* (agate, a hardened
+runtime, or Agamen's own kernel — see ROADMAP M5) only when all of the
+following hold:
 
 - it is on the **authority decision path** (without it, an invariant is
   enforceable only by convention);

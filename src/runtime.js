@@ -1,11 +1,11 @@
 /**
- * agent-substrate v0 — actors + object capabilities + membranes + provenance.
+ * Agamen v0 — actors + object capabilities + membranes + provenance.
  *
- * Userspace incubator for execution semantics that may later graduate into
- * the Agate kernel (github.com/aznikline/agate, spec/13-agent-execution-substrate).
- * v0 is single-threaded and in-process; caller identity is a passed actor
- * reference, not a hardware stamp — every deviation from the kernel model is
- * flagged inline.
+ * The in-process reference substrate for the normative invariants in
+ * spec/invariants.md (inherited from agate spec 13; ids preserved). v0 is
+ * single-threaded; caller identity is a passed actor reference, not a
+ * transport stamp — every deviation from kernel-grade enforcement is flagged
+ * inline and tracked in ROADMAP.md.
  */
 
 import { createHash } from "node:crypto";

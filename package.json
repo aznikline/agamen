@@ -1,7 +1,7 @@
 {
-  "name": "agent-substrate",
+  "name": "agamen",
   "version": "0.0.1",
-  "description": "Actors + object capabilities + membranes + provenance: a userspace incubator for AI-agent execution semantics beyond the OS process model.",
+  "description": "The steadfast substrate: actors + object capabilities + membranes + provenance — an execution form for AI agents beyond the OS process model.",
   "type": "module",
   "license": "MIT",
   "engines": { "node": ">=20" },
